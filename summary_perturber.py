@@ -1,1034 +1,934 @@
 #!/usr/bin/env python3
-# ============================================================
-#  summary_perturber.py
+# summary_perturber.py
+# Per-run analysis of Plummer sphere + perturber N-body simulation.
+# Particle index 0 = perturber; indices 1..N_BG = background Plummer sphere.
 #
-#  Two operating modes:
+#   Background analyses, chi2 and KS goodness-of-fit tests at final snapshot
+#   orbital decay vs Chandrasekhar (fixed and R-dependent ln_Lambda),
+#   angular momentum loss, speed vs v_circ,
+#   deceleration (-dL/dt / R) vs theory, energy conservation,
+#   energy partitioning, background heating, trajectory, gravitational wake,
+#   Coulomb logarithm (measured and theoretical R-dependent).
 #
-#  MODE A — per-run analysis (called by run_single_perturber.sh):
-#    python3 summary_perturber.py <run_dir> --eta E --R0 R --N N --eps EPS
-#
-#    Reads plummer_perturber.out from <run_dir>, computes all
-#    diagnostics on the fly (streaming, low RAM), writes PDFs
-#    and a lightweight perturber_stats.npz to <run_dir>.
-#
-#  MODE B — combined analysis (called by finalize_perturber.sh):
-#    python3 summary_perturber.py --combined [--eta E] [--R0 R]
-#
-#    Loads all perturber_stats.npz files from run_perturber_*/,
-#    computes ensemble statistics, and writes combined PDFs to
-#    the current directory.
-#
-#  PERTURBER CONVENTION:
-#    Particle index 0 in every snapshot is the perturber.
-#    Indices 1..N are the background.
-#    This matches the output of sampling_plummer_perturber.py.
-#
-#  STREAMING READER:
-#    The treecode output file is read one snapshot at a time.
-#    Each snapshot is processed and discarded before the next
-#    is read.  RAM usage is O(N) regardless of N_snaps.
-#
-#  UNITS: G=1, M_tot=1, b=1 throughout.
-# ============================================================
+# python3 summary_perturber.py <run_dir> --eta E --R0 R --N N [--eps EPS]
 
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import os
-import sys
-import argparse
-import math
+import os, sys, math, json, argparse
 from scipy import stats
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import gaussian_filter1d
 
 # ============================================================
 #  ARGUMENT PARSING
 # ============================================================
 
-parser = argparse.ArgumentParser(
-    description='Analyse Plummer + perturber N-body simulation output.')
-
-parser.add_argument('run_dir', nargs='?', default=None,
-                    help='Path to a single run directory (Mode A). '
-                         'Omit when using --combined (Mode B).')
-parser.add_argument('--eta',      type=float, default=0.05,
-                    help='Perturber mass ratio M/M_tot (default: 0.05)')
-parser.add_argument('--R0',       type=float, default=None,
-                    help='Initial orbital radius (default: r_hm ~ 1.305)')
-parser.add_argument('--N',        type=int,   default=10000,
-                    help='Number of background particles (default: 10000)')
-parser.add_argument('--eps',      type=float, default=0.012,
-                    help='Softening length used in the run (default: 0.012)')
-parser.add_argument('--combined', action='store_true',
-                    help='Run in combined (Mode B) ensemble analysis.')
-
+parser = argparse.ArgumentParser()
+parser.add_argument('run_dir', help='directory containing plummer_perturber.out')
+parser.add_argument('--eta',  type=float, default=0.05)
+parser.add_argument('--R0',   type=float, default=None)
+parser.add_argument('--N',    type=int,   default=10000)
+parser.add_argument('--eps',  type=float, default=None)
 args = parser.parse_args()
 
-# ============================================================
-#  GLOBAL PHYSICAL CONSTANTS  (code units: G=1, M_tot=1, b=1)
-# ============================================================
+run_dir = args.run_dir
+if not os.path.isdir(run_dir):
+    print(f"[ERROR] run_dir not found: {run_dir}")
+    sys.exit(1)
 
-G      = 1.0
-M_tot  = 1.0
-b      = 1.0
-r_hm   = b / math.sqrt(2.0**(2.0/3.0) - 1.0)   # ~ 1.305
-rho_c  = 3.0 * M_tot / (4.0 * math.pi * b**3)   # = 3/(4*pi)
-t_dyn  = math.sqrt(3.0 * math.pi / (16.0 * G * rho_c))  # = pi/2
+#---- constants ---- 
 
-ETA    = args.eta
-M_pert = ETA * M_tot
-N_BG   = args.N
-m_bg   = M_tot / N_BG                           # background particle mass
-R0_ARG = args.R0 if args.R0 is not None else r_hm
-EPS    = args.eps
+G     = 1.0
+M_tot = 1.0
+b     = 1.0
+ETA   = args.eta
+M_p   = ETA * M_tot
+N_BG  = args.N
+m_bg  = M_tot / N_BG
+N_total = N_BG + 1
+
+r_hm  = b / math.sqrt(2.0**(2.0/3.0) - 1.0)
+rho_c = 3.0 * M_tot / (4.0 * math.pi * b**3) # central density
+t_dyn = math.sqrt(3.0 * math.pi / (16.0 * G * rho_c)) # pi/2
+R0_ARG    = args.R0 if args.R0 is not None else r_hm
+ln_lam    = math.log(1.0 / ETA) # global = ln(M_tot/M_p)
+sv_theory = math.sqrt(3.0 * math.pi * G * M_tot / (32.0 * b)) # theoretical sigma_v
+
+LAG_FRACS = [0.10, 0.25, 0.50, 0.75, 0.90]
+
+# resolve eps
+EPS = args.eps
+if EPS is None:
+    pfile = os.path.join(run_dir, 'params_recommended.json')
+    if os.path.isfile(pfile):
+        with open(pfile) as f:
+            EPS = json.load(f)['eps']
+        print(f"eps read from params_recommended.json: {EPS}")
+    else:
+        print("[ERROR] --eps not given and params_recommended.json not found")
+        sys.exit(1)
+
+outfile = os.path.join(run_dir, 'plummer_perturber.out')
+if not os.path.isfile(outfile):
+    print(f"[ERROR] not found: {outfile}")
+    sys.exit(1)
+
+print(f"run_dir={run_dir}  eta={ETA}  R0={R0_ARG:.4f}  N={N_BG}  eps={EPS:.4f}")
 
 # ============================================================
 #  ANALYTICAL PLUMMER FUNCTIONS
 # ============================================================
 
-def plummer_density(r):
-    """Plummer density profile rho(r)."""
-    return (3.0 * M_tot / (4.0 * math.pi * b**3)) * (1.0 + r**2 / b**2)**(-2.5)
+def plummer_rho(r):
+    return (3.0 * M_tot / (4.0 * math.pi * b**3)) * (1.0 + (r / b)**2)**(-2.5)
 
 def plummer_mass_enc(r):
-    """Enclosed mass M(<r) for the Plummer sphere."""
     return M_tot * r**3 / (r**2 + b**2)**1.5
 
-def plummer_sigma2(r):
-    """Isotropic 1D velocity dispersion squared sigma^2(r)."""
-    return G * M_tot / (6.0 * math.sqrt(r**2 + b**2))
-
 def plummer_vcirc(r):
-    """Circular speed v_circ(r) = sqrt(G*M(<r)/r)."""
-    if r <= 0.0:
-        return 0.0
-    return math.sqrt(G * plummer_mass_enc(r) / r)
+    return math.sqrt(G * plummer_mass_enc(r) / r) if r > 0 else 0.0
+
+def plummer_dLdR(R):
+    """d(R * v_circ) / dR for a Plummer sphere."""
+    if R <= 0:
+        return 1e-10
+    R2  = R * R
+    b2  = b * b
+    vc  = plummer_vcirc(R)
+    if vc < 1e-12:
+        return 1e-10
+    dvc = G * M_tot * R * (2.0*b2 - R2) / (2.0 * vc * (R2 + b2)**2.5)
+    return vc + R * dvc
+
+def plummer_cdf(r):
+    return r**3 / (r**2 + b**2)**1.5
+
+def sigma_theory_jeans(r_arr):
+    return np.sqrt(G * M_tot / (6.0 * np.sqrt(r_arr**2 + b**2)))
+
+def lag_radius_theory(frac):
+    lo, hi = 0.0, 1000.0 * b
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        if mid**3 / (mid**2 + b**2)**1.5 < frac:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+LAG_THEORY = [lag_radius_theory(f) for f in LAG_FRACS]
+
+# ============================================================
+#  CHANDRASEKHAR FRICTION FUNCTIONS
+# ============================================================
 
 def chandrasekhar_bracket(X):
-    """Chandrasekhar bracket B(X) = erf(X) - (2X/sqrt(pi))*exp(-X^2).
-    X = v_M / (sqrt(2) * sigma).
-    B(X) is the fraction of background particles slower than v_M,
-    weighted by the Maxwellian distribution."""
-    from math import erf, exp, sqrt, pi
-    return erf(X) - (2.0 * X / sqrt(pi)) * exp(-X**2)
+    return math.erf(X) - (2.0 * X / math.sqrt(math.pi)) * math.exp(-X**2)
 
-def chandrasekhar_decel(R, v_M, M_p, ln_lam):
-    """Chandrasekhar dynamical friction deceleration magnitude.
-    Returns a_fric = |dv_M/dt| in code units.
-    Uses local Plummer density and velocity dispersion at radius R."""
-    rho   = plummer_density(R)
-    sig2  = plummer_sigma2(R)
+def chandrasekhar_decel(R, v_M, M_p_val, ln_lam_val):
+    """Chandrasekhar DF deceleration magnitude for given ln_Lambda."""
+    rho_r = plummer_rho(R)
+    sig2  = G * M_tot / (6.0 * math.sqrt(R**2 + b**2))
     sigma = math.sqrt(sig2)
-    if v_M <= 0.0 or sigma <= 0.0:
+    if v_M <= 0.0 or sigma <= 0.0 or ln_lam_val <= 0.0:
         return 0.0
-    X     = v_M / (math.sqrt(2.0) * sigma)
-    B     = chandrasekhar_bracket(X)
+    X = v_M / (math.sqrt(2.0) * sigma)
+    B = chandrasekhar_bracket(X)
     if B <= 0.0:
         return 0.0
-    return 4.0 * math.pi * G**2 * M_p * rho * ln_lam * B / v_M**2
+    return 4.0 * math.pi * G**2 * M_p_val * rho_r * ln_lam_val * B / v_M**2
 
-# ============================================================
-#  TREECODE OUTPUT READER  (streaming, O(N) RAM)
-# ============================================================
-
-def iter_snapshots(filepath, N_total):
-    """Generator: yield one snapshot at a time from a Barnes treecode
-    output file.  Each snapshot is a dict:
-        t       : float, simulation time
-        masses  : (N_total,) array
-        pos     : (N_total, 3) array
-        vel     : (N_total, 3) array
-        phi     : (N_total,) array  (gravitational potential)
-    N_total = N_background + 1 (perturber is index 0).
+def ln_lam_at_R(R):
     """
+    R-dependent Coulomb logarithm: ln(M(<R) / M_p).
+    As the orbit decays, b_max ~ R shrinks, so ln_Lambda decreases.
+    Uses max() to ensure the logarithm never drops to exactly 0 or negative,
+    keeping the theoretical curve visible even when the perturber stalls.
+    """
+    M_enc = plummer_mass_enc(R)
+    return math.log(max(M_enc / M_p, 1.1))
+
+# ============================================================
+#  HELPER FUNCTIONS
+# ============================================================
+
+def compute_reduced_chi2(obs, exp, sigma, dof_adj=0):
+    obs   = np.asarray(obs,   dtype=float)
+    exp   = np.asarray(exp,   dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    mask  = (exp > 0) & (sigma > 0) & np.isfinite(obs) & np.isfinite(exp)
+    n_eff = int(mask.sum())
+    if n_eff <= dof_adj:
+        return np.nan, np.nan
+    chi2 = np.sum(((obs[mask] - exp[mask]) / sigma[mask])**2)
+    dof  = n_eff - dof_adj
+    return chi2 / dof, 1.0 - stats.chi2.cdf(chi2, dof)
+
+def lagrangian_radii(r_sorted, N):
+    return [r_sorted[max(0, int(f * N) - 1)] for f in LAG_FRACS]
+
+def velocity_stats(pos, vel):
+    """sigma_v (3D), sigma_vr, sigma_vt, mean_vr — all in CM frame."""
+    pos_c = pos - np.mean(pos, axis=0)
+    vel_c = vel - np.mean(vel, axis=0)
+    r_mag = np.linalg.norm(pos_c, axis=1, keepdims=True)
+    r_hat = pos_c / np.where(r_mag == 0, 1e-10, r_mag)
+    vr    = np.sum(vel_c * r_hat, axis=1)
+    v2    = np.sum(vel_c**2, axis=1)
+    vt    = np.sqrt(np.maximum(v2 - vr**2, 0.0))
+    return (math.sqrt(float(np.mean(v2))),
+            float(np.std(vr)),
+            float(np.std(vt)),
+            float(np.mean(vr)))
+
+def bin_density_profile(pos, n_bins=35):
+    cm  = np.mean(pos, axis=0)
+    r   = np.linalg.norm(pos - cm, axis=1)
+    if len(r) < 5:
+        return None, None, None
+    bins  = np.logspace(np.log10(max(r.min(), 1e-6)), np.log10(r.max()), n_bins)
+    cnt, edges = np.histogram(r, bins=bins)
+    r_mid = np.sqrt(edges[:-1] * edges[1:])
+    vol   = (4.0 / 3.0) * np.pi * (edges[1:]**3 - edges[:-1]**3)
+    rho   = cnt * m_bg / vol
+    ok    = cnt > 0
+    return r_mid[ok], rho[ok], cnt[ok]
+
+def jeans_profile(pos, vel, n_bins=18):
+    cm    = np.mean(pos, axis=0)
+    pos_c = pos - cm
+    vel_c = vel - np.mean(vel, axis=0)
+    r     = np.linalg.norm(pos_c, axis=1)
+    r_hat = pos_c / np.where(r[:, None] == 0, 1e-10, r[:, None])
+    vr    = np.sum(vel_c * r_hat, axis=1)
+    vt2   = np.maximum(np.sum(vel_c**2, axis=1) - vr**2, 0.0)
+    bins  = np.logspace(-1.0, 1.0, n_bins + 1)
+    r_mid = np.sqrt(bins[:-1] * bins[1:])
+    sig_r = np.full(n_bins, np.nan)
+    sig_t = np.full(n_bins, np.nan)
+    ratio = np.full(n_bins, np.nan)
+    counts = np.zeros(n_bins, dtype=float)
+    for k in range(n_bins):
+        mask = (r >= bins[k]) & (r < bins[k + 1])
+        counts[k] = mask.sum()
+        if counts[k] > 5:
+            sr = np.std(vr[mask])
+            st = math.sqrt(float(np.mean(vt2[mask])) / 2.0)
+            sig_r[k] = sr
+            sig_t[k] = st
+            if sr > 0:
+                ratio[k] = st / sr
+    return r_mid, sig_r, sig_t, ratio, counts
+
+def anisotropy_profile(pos, vel, n_bins=15):
+    cm    = np.mean(pos, axis=0)
+    pos_c = pos - cm
+    vel_c = vel - np.mean(vel, axis=0)
+    r     = np.linalg.norm(pos_c, axis=1)
+    r_hat = pos_c / np.where(r[:, None] == 0, 1e-10, r[:, None])
+    vr    = np.sum(vel_c * r_hat, axis=1)
+    vt2   = np.maximum(np.sum(vel_c**2, axis=1) - vr**2, 0.0)
+    bins  = np.logspace(np.log10(max(r.min(), 1e-6)), np.log10(r.max()), n_bins + 1)
+    r_mid = np.sqrt(bins[:-1] * bins[1:])
+    ratio = np.full(n_bins, np.nan)
+    for k in range(n_bins):
+        mask = (r >= bins[k]) & (r < bins[k + 1])
+        if mask.sum() > 5:
+            sr = np.std(vr[mask])
+            st = math.sqrt(float(np.mean(vt2[mask])) / 2.0)
+            if sr > 0:
+                ratio[k] = st / sr
+    ok = np.isfinite(ratio)
+    return r_mid[ok], ratio[ok]
+
+# ============================================================
+#  SNAPSHOT READER
+# ============================================================
+
+def iter_snapshots(filepath, N_tot):
     with open(filepath, 'r') as fh:
         while True:
-            # --- header: N, ndim, t ---
-            line_N = fh.readline()
-            if not line_N:
-                return                           # EOF
-            line_N = line_N.strip()
-            if not line_N:
-                continue                         # skip blank separator lines
+            line = fh.readline()
+            if not line:
+                return
+            line = line.strip()
+            if not line:
+                continue
             try:
-                n_snap = int(line_N)
+                n_snap = int(line)
             except ValueError:
                 continue
-            ndim = int(fh.readline())
-            t    = float(fh.readline())
-
-            if n_snap != N_total:
-                # mismatch: skip this snapshot defensively
+            int(fh.readline())       # ndim
+            t = float(fh.readline())
+            if n_snap != N_tot:
                 for _ in range(4 * n_snap):
                     fh.readline()
                 continue
-
-            # --- masses ---
-            masses = np.empty(N_total)
-            for i in range(N_total):
-                masses[i] = float(fh.readline())
-
-            # --- positions ---
-            pos = np.empty((N_total, 3))
-            for i in range(N_total):
-                pos[i] = [float(x) for x in fh.readline().split()]
-
-            # --- velocities ---
-            vel = np.empty((N_total, 3))
-            for i in range(N_total):
-                vel[i] = [float(x) for x in fh.readline().split()]
-
-            # --- potentials ---
-            phi = np.empty(N_total)
-            for i in range(N_total):
-                phi[i] = float(fh.readline())
-
-            yield {'t': t, 'masses': masses, 'pos': pos,
-                   'vel': vel, 'phi': phi}
+            for _ in range(N_tot):   # masses (discard)
+                fh.readline()
+            pos = np.array([[float(x) for x in fh.readline().split()]
+                            for _ in range(N_tot)])
+            vel = np.array([[float(x) for x in fh.readline().split()]
+                            for _ in range(N_tot)])
+            phi = np.array([float(fh.readline()) for _ in range(N_tot)])
+            yield t, pos, vel, phi
 
 # ============================================================
-#  LAGRANGIAN RADII HELPER
+#  PASS 1 — MAIN STREAMING PASS
 # ============================================================
 
-LAGR_FRACS = [0.10, 0.25, 0.50, 0.75, 0.90]
-
-def lagrangian_radii(r_sorted, N):
-    """Return Lagrangian radii at LAGR_FRACS for a sorted radius array."""
-    return [r_sorted[max(0, int(f * N) - 1)] for f in LAGR_FRACS]
-
-# ============================================================
-#  WAKE DENSITY MAP HELPER
-# ============================================================
-
-def build_wake_map(pos_bg, pos_pert, vel_pert, n_bins=60, half_size=2.0):
-    """Return a 2D histogram of background particles in the comoving
-    frame of the perturber, with x-axis aligned with v_perturber.
-    Returns (H, xedges, yedges) where H[i,j] is the particle count."""
-    v_mag = np.linalg.norm(vel_pert)
-    if v_mag < 1e-10:
-        e_x = np.array([1.0, 0.0, 0.0])
-    else:
-        e_x = vel_pert / v_mag
-
-    # build an orthonormal frame: e_x (motion dir), e_y (in orbital plane)
-    # e_z is cross product — not used in the 2D map
-    trial = np.array([0.0, 1.0, 0.0])
-    if abs(np.dot(e_x, trial)) > 0.9:
-        trial = np.array([0.0, 0.0, 1.0])
-    e_y = np.cross(e_x, trial)
-    e_y /= np.linalg.norm(e_y)
-
-    # relative positions in the perturber frame
-    dr = pos_bg - pos_pert           # (N_bg, 3)
-    xi = dr @ e_x                   # component along velocity
-    yi = dr @ e_y                   # component perpendicular (in-plane)
-
-    edges = np.linspace(-half_size, half_size, n_bins + 1)
-    H, xe, ye = np.histogram2d(xi, yi, bins=[edges, edges])
-    return H, xe, ye
-
-# ============================================================
-#  MODE A — PER-RUN ANALYSIS
-# ============================================================
-
-def run_single_analysis(run_dir, eta, R0_init, N_bg, eps):
-    """Full analysis of one run.  Writes PDFs and perturber_stats.npz."""
-
-    outfile = os.path.join(run_dir, 'plummer_perturber.out')
-    if not os.path.isfile(outfile):
-        print(f"[ERROR] Output file not found: {outfile}", flush=True)
-        sys.exit(1)
-
-    N_total  = N_bg + 1        # perturber is index 0
-    M_p      = eta * M_tot
-    m_i      = M_tot / N_bg
-    ln_lam   = math.log(1.0 / eta) if eta < 1.0 else 1.0  # Coulomb log ~ ln(1/eta)
-
-    print(f"\n{'='*60}", flush=True)
-    print(f"  summary_perturber.py — per-run analysis", flush=True)
-    print(f"  run_dir  : {run_dir}", flush=True)
-    print(f"  eta={eta:.4f}  R0={R0_init:.4f}  N_bg={N_bg}  eps={eps:.4f}", flush=True)
-    print(f"  M_pert={M_p:.6f}  m_bg={m_i:.6e}  ln_Lambda={ln_lam:.3f}", flush=True)
-    print(f"{'='*60}", flush=True)
-
-    # ---- storage arrays (one entry per snapshot) ----
-    times         = []
-
-    # perturber kinematic time series
-    R_M           = []   # orbital radius
-    v_M           = []   # speed
-    Lz_M          = []   # z-component of specific angular momentum
-    L_M           = []   # magnitude of specific angular momentum
-    E_orb_M       = []   # specific orbital energy (kinetic + phi_background)
-
-    # background global quantities
-    K_bg_arr      = []   # background kinetic energy
-    W_bg_arr      = []   # background potential energy (from phi)
-    E_tot_arr     = []   # total system energy
-    virial_arr    = []   # 2K_bg / |W_bg|
-    sigma_v_arr   = []   # background 3D rms velocity
-    r_cm_bg_arr   = []   # background CM position magnitude
-
-    # Lagrangian radii of background only
-    lagr_arr      = []   # list of [r10, r25, r50, r75, r90]
-
-    # Chandrasekhar prediction (evaluated at each snapshot)
-    a_chandra_arr = []   # theoretical friction deceleration
-
-    # snapshots for wake map (store 3 snapshots: early, mid, late)
-    wake_snaps    = {}   # {label: (H, xe, ye)}
-
-    # perturber trajectory (for orbit plot)
-    x_M_traj      = []
-    y_M_traj      = []
-
-    # ---- first pass: count snapshots ----
-    print("  Counting snapshots...", end=' ', flush=True)
-    n_snaps_total = 0
-    with open(outfile, 'r') as fh:
-        for line in fh:
-            line = line.strip()
-            if line:
-                try:
-                    n_check = int(line)
-                    if n_check == N_total:
-                        n_snaps_total += 1
-                except ValueError:
-                    pass
-    print(f"{n_snaps_total} snapshots found.", flush=True)
-
-    if n_snaps_total == 0:
-        print("[ERROR] No valid snapshots found.", flush=True)
-        sys.exit(1)
-
-    snap_early = max(0,  n_snaps_total //  10)
-    snap_mid   = max(0,  n_snaps_total //  2)
-    snap_late  = max(0,  n_snaps_total  -  1)
-
-    # ---- second pass: streaming analysis ----
-    print("  Streaming analysis...", flush=True)
-
-    E0_total  = None   # first-snapshot total energy (for conservation check)
-    snap_idx  = 0
-
-    for snap in iter_snapshots(outfile, N_total):
-        t      = snap['t']
-        pos    = snap['pos']
-        vel    = snap['vel']
-        phi    = snap['phi']
-
-        # --- separate perturber (index 0) from background (1..N_total) ---
-        pos_p  = pos[0]
-        vel_p  = vel[0]
-        phi_p  = phi[0]        # potential at perturber location (total)
-
-        pos_bg = pos[1:]       # (N_bg, 3)
-        vel_bg = vel[1:]       # (N_bg, 3)
-        phi_bg_arr = phi[1:]   # (N_bg,)  potential at each bg particle
-
-        # --- background CM (excluding perturber) ---
-        r_cm_bg = np.mean(pos_bg, axis=0)
-        v_cm_bg = np.mean(vel_bg, axis=0)
-
-        # --- perturber in CM frame of background ---
-        dr_p   = pos_p - r_cm_bg
-        dv_p   = vel_p - v_cm_bg
-
-        R_p    = float(np.linalg.norm(dr_p))   # orbital radius
-        v_p_s  = float(np.linalg.norm(dv_p))   # speed
-
-        # specific angular momentum
-        L_vec  = np.cross(dr_p, dv_p)
-        Lz_p   = float(L_vec[2])
-        L_p    = float(np.linalg.norm(L_vec))
-
-        # orbital energy of perturber:
-        #   E_orb = (1/2) v^2 + phi_background
-        # phi[0] is the TOTAL potential at the perturber (including self).
-        # The perturber's self-potential is phi_self = G*M_p/eps (softened,
-        # at r=0 from itself), which is a constant and not physically
-        # meaningful.  We approximate phi_background ~ phi_total - phi_self_correction.
-        # For diagnostic purposes we use phi[0] directly; the self-energy
-        # term cancels when comparing E_orb at different times.
-        E_orb_p = 0.5 * v_p_s**2 + phi_p
-
-        # --- background energetics ---
-        v_bg_sq    = np.sum(vel_bg**2, axis=1)       # (N_bg,)
-        K_bg       = 0.5 * m_i * np.sum(v_bg_sq)
-        W_bg       = 0.5 * m_i * np.sum(phi_bg_arr)  # W = (1/2)*sum(m_i * phi_i)
-        # Note: phi_bg_arr already includes the perturber's contribution to
-        # each background particle's potential, which is physical.
-
-        # --- total system energy ---
-        K_pert    = 0.5 * M_p * v_p_s**2
-        E_total   = K_bg + K_pert + 0.5 * (M_p * phi_p + m_i * np.sum(phi_bg_arr))
-
-        if E0_total is None:
-            E0_total = E_total
-
-        # --- virial ratio of background ---
-        virial = -2.0 * K_bg / W_bg if abs(W_bg) > 1e-12 else 0.0
-
-        # --- background velocity dispersion ---
-        sigma_v = float(math.sqrt(np.mean(v_bg_sq)))
-
-        # --- background Lagrangian radii ---
-        r_bg_mag  = np.linalg.norm(pos_bg - r_cm_bg, axis=1)
-        r_bg_sort = np.sort(r_bg_mag)
-        lagr      = lagrangian_radii(r_bg_sort, N_bg)
-
-        # --- Chandrasekhar deceleration at current R_p, v_p ---
-        a_ch = chandrasekhar_decel(R_p, v_p_s, M_p, ln_lam)
-
-        # --- store time series ---
-        times.append(t)
-        R_M.append(R_p)
-        v_M.append(v_p_s)
-        Lz_M.append(Lz_p)
-        L_M.append(L_p)
-        E_orb_M.append(E_orb_p)
-        K_bg_arr.append(K_bg)
-        W_bg_arr.append(W_bg)
-        E_tot_arr.append(E_total)
-        virial_arr.append(virial)
-        sigma_v_arr.append(sigma_v)
-        r_cm_bg_arr.append(float(np.linalg.norm(r_cm_bg)))
-        lagr_arr.append(lagr)
-        a_chandra_arr.append(a_ch)
-        x_M_traj.append(float(pos_p[0]))
-        y_M_traj.append(float(pos_p[1]))
-
-        # --- save wake maps at three epochs ---
-        if snap_idx == snap_early:
-            H, xe, ye = build_wake_map(pos_bg, pos_p, vel_p)
-            wake_snaps['early'] = (H, xe, ye, t)
-        elif snap_idx == snap_mid:
-            H, xe, ye = build_wake_map(pos_bg, pos_p, vel_p)
-            wake_snaps['mid'] = (H, xe, ye, t)
-        elif snap_idx == snap_late:
-            H, xe, ye = build_wake_map(pos_bg, pos_p, vel_p)
-            wake_snaps['late'] = (H, xe, ye, t)
-
-        snap_idx += 1
-
-        if snap_idx % 200 == 0:
-            print(f"    processed {snap_idx}/{n_snaps_total} snapshots...",
-                  flush=True)
-
-    print(f"  Streaming complete. {snap_idx} snapshots processed.", flush=True)
-
-    # ---- convert to numpy arrays ----
-    times         = np.array(times)
-    R_M           = np.array(R_M)
-    v_M           = np.array(v_M)
-    Lz_M          = np.array(Lz_M)
-    L_M           = np.array(L_M)
-    E_orb_M       = np.array(E_orb_M)
-    K_bg_arr      = np.array(K_bg_arr)
-    W_bg_arr      = np.array(W_bg_arr)
-    E_tot_arr     = np.array(E_tot_arr)
-    virial_arr    = np.array(virial_arr)
-    sigma_v_arr   = np.array(sigma_v_arr)
-    r_cm_bg_arr   = np.array(r_cm_bg_arr)
-    lagr_arr      = np.array(lagr_arr)       # (n_snaps, 5)
-    a_chandra_arr = np.array(a_chandra_arr)
-    x_M_traj      = np.array(x_M_traj)
-    y_M_traj      = np.array(y_M_traj)
-
-    # ---- derived diagnostics ----
-
-    # energy conservation
-    dE_over_E0 = np.abs((E_tot_arr - E0_total) / E0_total) if E0_total != 0 else E_tot_arr * 0
-
-    # orbital decay rate (smoothed finite difference of R_M)
-    # smooth over ~10 snapshots to suppress one-orbit oscillations
-    smooth_win  = max(3, len(times) // 50)
-    R_M_smooth  = uniform_filter1d(R_M, size=smooth_win)
-    v_M_smooth  = uniform_filter1d(v_M, size=smooth_win)
-    L_M_smooth  = uniform_filter1d(L_M, size=smooth_win)
-    dt_snap     = float(np.median(np.diff(times))) if len(times) > 1 else 1.0
-    dR_dt       = np.gradient(R_M_smooth, dt_snap)  # dR/dt
-
-    # mean decay rate (slope of R_M over the full run)
-    if len(times) > 1:
-        slope_R, intercept_R, r_R, _, _ = stats.linregress(times, R_M)
-        slope_L, _, _, _, _ = stats.linregress(times, L_M)
-    else:
-        slope_R = slope_L = 0.0
-
-    # Coulomb logarithm ratio: measured decel / Chandrasekhar
-    # estimated deceleration from smoothed v_M
-    dv_dt = np.gradient(v_M_smooth, dt_snap)
-    # ratio = |dv/dt| / a_chandra  (where a_chandra uses ln_lam=1)
-    a_chandra_lam1 = np.array([chandrasekhar_decel(R_M[i], v_M[i], M_p, 1.0)
-                                for i in range(len(times))])
-    with np.errstate(divide='ignore', invalid='ignore'):
-        lnlam_eff = np.where(a_chandra_lam1 > 1e-12,
-                             np.abs(dv_dt) / a_chandra_lam1,
-                             np.nan)
-
-    # Chandrasekhar prediction trajectory:
-    # integrate dR/dt = -a_fric(R,v_circ(R)) / v_circ(R) * R
-    # using forward Euler from R0 at each time step dt_snap
-    R_chandra = np.empty(len(times))
-    R_chandra[0] = R_M[0]
-    for i in range(1, len(times)):
-        R_prev = R_chandra[i-1]
-        if R_prev < 0.01:
-            R_chandra[i] = R_prev
-            continue
-        vc    = plummer_vcirc(R_prev)
-        a_fc  = chandrasekhar_decel(R_prev, max(vc, 0.01), M_p, ln_lam)
-        dR    = -a_fc * R_prev / max(vc, 0.01) * dt_snap
-        R_chandra[i] = max(0.01, R_prev + dR)
-
-    # background heating: DeltaK_bg = K_bg(t) - K_bg(0)
-    DK_bg = K_bg_arr - K_bg_arr[0]
-
-    # print scalar diagnostics
-    print(f"\n  [SCALAR DIAGNOSTICS]", flush=True)
-    print(f"    t_final              : {times[-1]:.2f}", flush=True)
-    print(f"    R_M(0)               : {R_M[0]:.4f}", flush=True)
-    print(f"    R_M(final)           : {R_M[-1]:.4f}", flush=True)
-    print(f"    Delta R / R0         : {(R_M[0]-R_M[-1])/R_M[0]:.4f}", flush=True)
-    print(f"    dR/dt (linear fit)   : {slope_R:.4e}", flush=True)
-    print(f"    dL/dt (linear fit)   : {slope_L:.4e}", flush=True)
-    print(f"    max |dE/E0|          : {np.max(dE_over_E0):.4e}", flush=True)
-    print(f"    mean virial (bg)     : {np.mean(virial_arr):.4f}  (target: 1.000)", flush=True)
-    print(f"    sigma_v drift        : {(sigma_v_arr[-1]-sigma_v_arr[0])/sigma_v_arr[0]:.4f}", flush=True)
-    print(f"    DeltaK_bg / K_bg(0)  : {DK_bg[-1]/K_bg_arr[0]:.4f}  (bg heating)", flush=True)
-    lnlam_valid = lnlam_eff[np.isfinite(lnlam_eff)]
-    if len(lnlam_valid) > 0:
-        print(f"    ln_Lambda_eff (med)  : {np.nanmedian(lnlam_eff):.3f}", flush=True)
-        print(f"    ln_Lambda theory     : {ln_lam:.3f}", flush=True)
-
-    # ============================================================
-    #  PLOTS
-    # ============================================================
-
-    print("\n  Generating plots...", flush=True)
-    plt.rcParams.update({'font.size': 9, 'figure.dpi': 120})
-    figs_written = []
-
-    # ---------- Figure 1: Orbital decay ----------
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
-    fig.suptitle(f'Orbital decay  |  η={eta:.3f}  R₀={R0_init:.3f}  '
-                 f'ε={eps:.4f}  N={N_bg}', fontsize=10)
-
-    ax = axes[0, 0]
-    ax.plot(times / t_dyn, R_M, color='steelblue', lw=0.8,
-            alpha=0.6, label='simulated R_M(t)')
-    ax.plot(times / t_dyn, R_M_smooth, color='navy', lw=1.5,
-            label=f'smoothed (win={smooth_win})')
-    ax.plot(times / t_dyn, R_chandra, color='firebrick', lw=1.5,
-            ls='--', label=f'Chandrasekhar (ln Λ={ln_lam:.2f})')
-    ax.axhline(r_hm, color='gray', ls=':', lw=0.8, label=f'r_hm={r_hm:.3f}')
-    ax.set_xlabel('t / t_dyn')
-    ax.set_ylabel('R_M  [code units]')
-    ax.set_title('Orbital radius decay')
-    ax.legend(fontsize=7)
-
-    ax = axes[0, 1]
-    ax.plot(times / t_dyn, L_M, color='steelblue', lw=0.8,
-            alpha=0.6, label='|L_M|')
-    ax.plot(times / t_dyn, L_M_smooth, color='navy', lw=1.5,
-            label='smoothed')
-    ax.plot(times / t_dyn, Lz_M, color='darkorange', lw=0.8,
-            alpha=0.6, label='L_z')
-    ax.set_xlabel('t / t_dyn')
-    ax.set_ylabel('Specific angular momentum')
-    ax.set_title('Angular momentum loss')
-    ax.legend(fontsize=7)
-
-    ax = axes[1, 0]
-    ax.plot(times / t_dyn, v_M, color='steelblue', lw=0.8,
-            alpha=0.5, label='|v_M|')
-    ax.plot(times / t_dyn, v_M_smooth, color='navy', lw=1.5,
-            label='smoothed')
-    vc_theory = np.array([plummer_vcirc(r) for r in R_M_smooth])
-    ax.plot(times / t_dyn, vc_theory, color='firebrick', lw=1.2,
-            ls='--', label='v_circ(R_M) theory')
-    ax.set_xlabel('t / t_dyn')
-    ax.set_ylabel('Speed  [code units]')
-    ax.set_title('Perturber speed vs circular velocity')
-    ax.legend(fontsize=7)
-
-    ax = axes[1, 1]
-    ax.plot(times / t_dyn, np.abs(dv_dt), color='steelblue', lw=0.8,
-            alpha=0.6, label='|dv/dt| measured')
-    ax.plot(times / t_dyn, a_chandra_arr, color='firebrick', lw=1.5,
-            ls='--', label=f'a_Chandra (ln Λ={ln_lam:.2f})')
-    ax.set_xlabel('t / t_dyn')
-    ax.set_ylabel('Deceleration  [code units]')
-    ax.set_title('Friction deceleration vs Chandrasekhar')
-    ax.set_yscale('log')
-    ax.legend(fontsize=7)
-
-    plt.tight_layout()
-    fname1 = os.path.join(run_dir, 'plot_orbital_decay.pdf')
-    fig.savefig(fname1, bbox_inches='tight')
-    plt.close(fig)
-    figs_written.append(fname1)
-    print(f"    written: {os.path.basename(fname1)}", flush=True)
-
-    # ---------- Figure 2: Energy and background ----------
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
-    fig.suptitle(f'Energetics and background  |  η={eta:.3f}  N={N_bg}', fontsize=10)
-
-    ax = axes[0, 0]
-    ax.plot(times / t_dyn, dE_over_E0, color='navy', lw=1.0)
-    ax.set_xlabel('t / t_dyn')
-    ax.set_ylabel('|ΔE_tot / E_0|')
-    ax.set_title('Total energy conservation')
-    ax.set_yscale('log')
-    ax.axhline(1e-3, color='firebrick', ls='--', lw=0.8, label='0.1% threshold')
-    ax.legend(fontsize=7)
-
-    ax = axes[0, 1]
-    ax.plot(times / t_dyn, E_orb_M - E_orb_M[0], color='firebrick',
-            lw=1.2, label='ΔE_orb (perturber)')
-    ax.plot(times / t_dyn, DK_bg, color='steelblue', lw=1.2,
-            label='ΔK_bg (background heating)')
-    ax.plot(times / t_dyn,
-            (E_orb_M - E_orb_M[0]) + DK_bg,
-            color='gray', lw=1.0, ls='--', label='Sum (should ~ 0)')
-    ax.axhline(0, color='black', lw=0.5)
-    ax.set_xlabel('t / t_dyn')
-    ax.set_ylabel('Energy change  [code units]')
-    ax.set_title('Energy partitioning')
-    ax.legend(fontsize=7)
-
-    ax = axes[1, 0]
-    ax.plot(times / t_dyn, virial_arr, color='steelblue', lw=1.0)
-    ax.axhline(1.0, color='firebrick', ls='--', lw=0.8, label='virial = 1')
-    ax.set_xlabel('t / t_dyn')
-    ax.set_ylabel('2K_bg / |W_bg|')
-    ax.set_title('Background virial ratio')
-    ax.legend(fontsize=7)
-
-    ax = axes[1, 1]
-    lagr_colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
-    for k, (frac, col) in enumerate(zip(LAGR_FRACS, lagr_colors)):
-        ax.plot(times / t_dyn, lagr_arr[:, k], color=col, lw=1.0,
-                label=f'{int(frac*100)}%')
-    ax.axhline(r_hm, color='gray', ls=':', lw=0.8, label='r_hm')
-    ax.set_xlabel('t / t_dyn')
-    ax.set_ylabel('Lagrangian radius  [code units]')
-    ax.set_title('Background Lagrangian radii')
-    ax.legend(fontsize=7, ncol=2)
-
-    plt.tight_layout()
-    fname2 = os.path.join(run_dir, 'plot_energetics.pdf')
-    fig.savefig(fname2, bbox_inches='tight')
-    plt.close(fig)
-    figs_written.append(fname2)
-    print(f"    written: {os.path.basename(fname2)}", flush=True)
-
-    # ---------- Figure 3: Orbit trajectory + wake maps ----------
-    n_wake = len(wake_snaps)
-    fig, axes = plt.subplots(1, n_wake + 1, figsize=(4 * (n_wake + 1), 4))
-    if n_wake + 1 == 1:
-        axes = [axes]
-
-    ax = axes[0]
-    sc = ax.scatter(x_M_traj, y_M_traj, c=times, cmap='viridis',
-                    s=1.5, alpha=0.7)
-    plt.colorbar(sc, ax=ax, label='t [code units]')
-    ax.set_aspect('equal')
-    ax.set_xlabel('x  [code units]')
-    ax.set_ylabel('y  [code units]')
-    ax.set_title(f'Perturber trajectory  η={eta:.3f}')
-    circle = plt.Circle((0, 0), r_hm, color='gray', fill=False,
-                         ls='--', lw=0.8, label='r_hm')
-    ax.add_patch(circle)
-    ax.legend(fontsize=7)
-
-    for k, (label, (H, xe, ye, t_wake)) in enumerate(sorted(wake_snaps.items())):
-        ax = axes[k + 1]
-        Hlog = np.log10(H + 1)
-        im = ax.pcolormesh(xe, ye, Hlog.T, cmap='inferno')
-        plt.colorbar(im, ax=ax, label='log10(N+1)')
-        ax.set_xlabel('Along v_M  [code units]')
-        ax.set_ylabel('Perpendicular')
-        ax.set_title(f'Wake map ({label}, t={t_wake:.1f})')
-        ax.axvline(0, color='white', ls='--', lw=0.5)
-        ax.set_aspect('equal')
-
-    plt.tight_layout()
-    fname3 = os.path.join(run_dir, 'plot_orbit_wake.pdf')
-    fig.savefig(fname3, bbox_inches='tight')
-    plt.close(fig)
-    figs_written.append(fname3)
-    print(f"    written: {os.path.basename(fname3)}", flush=True)
-
-    # ---------- Figure 4: Coulomb logarithm ----------
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-    fig.suptitle(f'Effective Coulomb logarithm  |  η={eta:.3f}', fontsize=10)
-
-    ax = axes[0]
-    ax.plot(times / t_dyn, lnlam_eff, color='steelblue', lw=0.8, alpha=0.6)
-    ax.axhline(ln_lam, color='firebrick', ls='--', lw=1.0,
-               label=f'ln(1/η) = {ln_lam:.2f}')
-    ax.axhline(math.log(N_bg), color='darkorange', ls=':', lw=1.0,
-               label=f'ln(N) = {math.log(N_bg):.2f}')
-    ax.set_xlabel('t / t_dyn')
-    ax.set_ylabel('ln Λ_eff')
-    ax.set_title('Effective Coulomb logarithm vs time')
-    ax.set_ylim(0, max(5, math.log(N_bg) * 1.5))
-    ax.legend(fontsize=7)
-
-    ax = axes[1]
-    ax.plot(R_M[np.isfinite(lnlam_eff)],
-            lnlam_eff[np.isfinite(lnlam_eff)],
-            '.', color='steelblue', ms=2, alpha=0.5)
-    ax.axhline(ln_lam, color='firebrick', ls='--', lw=1.0,
-               label=f'ln(1/η) = {ln_lam:.2f}')
-    ax.set_xlabel('R_M  [code units]')
-    ax.set_ylabel('ln Λ_eff')
-    ax.set_title('Effective Coulomb logarithm vs orbital radius')
-    ax.legend(fontsize=7)
-
-    plt.tight_layout()
-    fname4 = os.path.join(run_dir, 'plot_coulomb_log.pdf')
-    fig.savefig(fname4, bbox_inches='tight')
-    plt.close(fig)
-    figs_written.append(fname4)
-    print(f"    written: {os.path.basename(fname4)}", flush=True)
-
-    # ============================================================
-    #  SAVE LIGHTWEIGHT NPZ
-    # ============================================================
-
-    npz_path = os.path.join(run_dir, 'perturber_stats.npz')
-    np.savez(npz_path,
-             # scalars
-             eta=np.float64(eta),
-             R0_init=np.float64(R0_init),
-             N_bg=np.int64(N_bg),
-             eps=np.float64(eps),
-             ln_lam=np.float64(ln_lam),
-             E0_total=np.float64(E0_total),
-             # time series
-             times=times,
-             R_M=R_M,
-             v_M=v_M,
-             L_M=L_M,
-             Lz_M=Lz_M,
-             E_orb_M=E_orb_M,
-             K_bg=K_bg_arr,
-             W_bg=W_bg_arr,
-             E_tot=E_tot_arr,
-             dE_over_E0=dE_over_E0,
-             virial=virial_arr,
-             sigma_v=sigma_v_arr,
-             r_cm_bg=r_cm_bg_arr,
-             lagr=lagr_arr,
-             a_chandra=a_chandra_arr,
-             R_chandra=R_chandra,
-             lnlam_eff=lnlam_eff,
-             dR_dt=dR_dt,
-             # scalar summaries
-             slope_R=np.float64(slope_R),
-             slope_L=np.float64(slope_L),
-             max_dE=np.float64(np.max(dE_over_E0)),
-             mean_virial=np.float64(np.mean(virial_arr)),
-             lnlam_eff_median=np.float64(np.nanmedian(lnlam_eff)),
-             DK_bg_final=np.float64(DK_bg[-1]),
-             DK_bg_frac=np.float64(DK_bg[-1] / K_bg_arr[0]),
-             )
-
-    print(f"    saved: {os.path.basename(npz_path)}", flush=True)
-    print(f"\n  PDFs written: {len(figs_written)}", flush=True)
-    for f in figs_written:
-        print(f"    {f}", flush=True)
-    print(f"{'='*60}", flush=True)
-
-# ============================================================
-#  MODE B — COMBINED ENSEMBLE ANALYSIS
-# ============================================================
-
-def run_combined_analysis(eta, R0_init):
-    """Load all perturber_stats.npz files and produce ensemble plots."""
-
-    base_dir  = os.getcwd()
-    run_dirs  = sorted([
-        os.path.join(base_dir, d)
-        for d in os.listdir(base_dir)
-        if d.startswith('run_perturber_') and
-           os.path.isdir(os.path.join(base_dir, d))
-    ])
-
-    npz_files = [os.path.join(d, 'perturber_stats.npz')
-                 for d in run_dirs
-                 if os.path.isfile(os.path.join(d, 'perturber_stats.npz'))]
-
-    print(f"\n{'='*60}", flush=True)
-    print(f"  summary_perturber.py — combined ensemble analysis", flush=True)
-    print(f"  Found {len(npz_files)} completed runs.", flush=True)
-    print(f"{'='*60}", flush=True)
-
-    if len(npz_files) == 0:
-        print("[ERROR] No perturber_stats.npz files found.", flush=True)
-        sys.exit(1)
-
-    # ---- load all runs ----
-    all_times        = []
-    all_R_M          = []
-    all_L_M          = []
-    all_E_orb        = []
-    all_dE           = []
-    all_virial       = []
-    all_K_bg         = []
-    all_lnlam        = []
-    all_R_chandra    = []
-    all_slope_R      = []
-    all_slope_L      = []
-    all_max_dE       = []
-    all_mean_virial  = []
-    all_DK_bg_frac   = []
-    all_lnlam_med    = []
-
-    ln_lam_ref = None
-
-    for npz_path in npz_files:
-        try:
-            d = np.load(npz_path, allow_pickle=False)
-        except Exception as e:
-            print(f"  [warn] Could not load {npz_path}: {e}", flush=True)
-            continue
-
-        all_times.append(d['times'])
-        all_R_M.append(d['R_M'])
-        all_L_M.append(d['L_M'])
-        all_E_orb.append(d['E_orb_M'])
-        all_dE.append(d['dE_over_E0'])
-        all_virial.append(d['virial'])
-        all_K_bg.append(d['K_bg'])
-        all_lnlam.append(d['lnlam_eff'])
-        all_R_chandra.append(d['R_chandra'])
-        all_slope_R.append(float(d['slope_R']))
-        all_slope_L.append(float(d['slope_L']))
-        all_max_dE.append(float(d['max_dE']))
-        all_mean_virial.append(float(d['mean_virial']))
-        all_DK_bg_frac.append(float(d['DK_bg_frac']))
-        all_lnlam_med.append(float(d['lnlam_eff_median']))
-        if ln_lam_ref is None:
-            ln_lam_ref = float(d['ln_lam'])
-
-    n_runs = len(all_R_M)
-    print(f"  Successfully loaded: {n_runs} runs", flush=True)
-
-    if n_runs == 0:
-        print("[ERROR] All npz files failed to load.", flush=True)
-        sys.exit(1)
-
-    # ---- interpolate all runs onto a common time grid ----
-    # use the time array of the first run as the reference
-    t_ref  = all_times[0]
-    R_interp = []
-    L_interp = []
-
-    for i in range(n_runs):
-        t_i   = all_times[i]
-        R_i   = all_R_M[i]
-        L_i   = all_L_M[i]
-        t_min = max(t_ref[0],  t_i[0])
-        t_max = min(t_ref[-1], t_i[-1])
-        mask  = (t_ref >= t_min) & (t_ref <= t_max)
-        R_interp_i = np.interp(t_ref[mask], t_i, R_i)
-        L_interp_i = np.interp(t_ref[mask], t_i, L_i)
-        R_interp.append((t_ref[mask], R_interp_i))
-        L_interp.append((t_ref[mask], L_interp_i))
-
-    # ensemble mean and std on the full reference grid
-    # (use only the common time range across ALL runs)
-    t_start = max(ri[0][0]  for ri in R_interp)
-    t_end   = min(ri[0][-1] for ri in R_interp)
-    t_mask  = (t_ref >= t_start) & (t_ref <= t_end)
-    t_common = t_ref[t_mask]
-
-    R_stack = np.array([np.interp(t_common, ri[0], ri[1]) for ri in R_interp])
-    L_stack = np.array([np.interp(t_common, li[0], li[1]) for li in L_interp])
-
-    R_mean  = np.mean(R_stack, axis=0)
-    R_std   = np.std(R_stack,  axis=0)
-    L_mean  = np.mean(L_stack, axis=0)
-    L_std   = np.std(L_stack,  axis=0)
-
-    # Chandrasekhar on common grid (from first run, re-evaluated)
-    ln_lam_use = ln_lam_ref if ln_lam_ref else math.log(1.0 / eta)
-    R_chandra_mean = np.interp(t_common, all_times[0], all_R_chandra[0])
-
-    # scalar summary statistics
-    slope_R_arr     = np.array(all_slope_R)
-    max_dE_arr      = np.array(all_max_dE)
-    virial_arr_comb = np.array(all_mean_virial)
-    DK_frac_arr     = np.array(all_DK_bg_frac)
-    lnlam_med_arr   = np.array(all_lnlam_med)
-
-    print(f"\n  [ENSEMBLE SUMMARY  (n_runs={n_runs})]", flush=True)
-    print(f"    <dR/dt>        : {np.mean(slope_R_arr):.4e} ± {np.std(slope_R_arr):.4e}", flush=True)
-    print(f"    <max |dE/E0|>  : {np.mean(max_dE_arr):.4e} ± {np.std(max_dE_arr):.4e}", flush=True)
-    print(f"    <virial>       : {np.mean(virial_arr_comb):.4f} ± {np.std(virial_arr_comb):.4f}", flush=True)
-    print(f"    <DK_bg/K0>     : {np.mean(DK_frac_arr):.4f} ± {np.std(DK_frac_arr):.4f}", flush=True)
-    print(f"    <ln Lam_eff>   : {np.nanmean(lnlam_med_arr):.3f} ± {np.nanstd(lnlam_med_arr):.3f}", flush=True)
-    print(f"    ln Lam theory  : {ln_lam_use:.3f}  (ln(1/eta))", flush=True)
-
-    # ============================================================
-    #  COMBINED PLOTS
-    # ============================================================
-
-    print("\n  Generating combined plots...", flush=True)
-    plt.rcParams.update({'font.size': 9, 'figure.dpi': 120})
-    figs_written = []
-
-    # ---------- Figure C1: Ensemble orbital decay ----------
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    fig.suptitle(f'Ensemble orbital decay  |  η={eta:.3f}  '
-                 f'N_runs={n_runs}  ln Λ={ln_lam_use:.2f}', fontsize=10)
-
-    ax = axes[0]
-    for i, (t_i, R_i) in enumerate(R_interp):
-        ax.plot(t_i / t_dyn, R_i, color='steelblue', lw=0.5, alpha=0.3)
-    ax.plot(t_common / t_dyn, R_mean, color='navy', lw=2.0,
-            label=f'ensemble mean (n={n_runs})')
-    ax.fill_between(t_common / t_dyn,
-                    R_mean - R_std, R_mean + R_std,
-                    color='steelblue', alpha=0.2, label='±1σ')
-    ax.plot(t_common / t_dyn, R_chandra_mean, color='firebrick',
-            lw=1.5, ls='--', label=f'Chandrasekhar')
-    ax.axhline(r_hm, color='gray', ls=':', lw=0.8, label=f'r_hm')
-    ax.set_xlabel('t / t_dyn')
-    ax.set_ylabel('R_M  [code units]')
-    ax.set_title('Orbital radius decay — ensemble')
-    ax.legend(fontsize=7)
-
-    ax = axes[1]
-    for i, (t_i, L_i) in enumerate(L_interp):
-        ax.plot(t_i / t_dyn, L_i, color='darkorange', lw=0.5, alpha=0.3)
-    ax.plot(t_common / t_dyn, L_mean, color='saddlebrown', lw=2.0,
-            label=f'ensemble mean')
-    ax.fill_between(t_common / t_dyn,
-                    L_mean - L_std, L_mean + L_std,
-                    color='darkorange', alpha=0.2, label='±1σ')
-    ax.set_xlabel('t / t_dyn')
-    ax.set_ylabel('|L_M|  [code units]')
-    ax.set_title('Angular momentum — ensemble')
-    ax.legend(fontsize=7)
-
-    plt.tight_layout()
-    fname = 'combined_orbital_decay.pdf'
-    fig.savefig(fname, bbox_inches='tight')
-    plt.close(fig)
-    figs_written.append(fname)
-    print(f"    written: {fname}", flush=True)
-
-    # ---------- Figure C2: Scalar distributions ----------
-    fig, axes = plt.subplots(2, 2, figsize=(11, 8))
-    fig.suptitle(f'Scalar distributions across realisations  |  '
-                 f'η={eta:.3f}  n_runs={n_runs}', fontsize=10)
-
-    ax = axes[0, 0]
-    ax.hist(slope_R_arr, bins=max(5, n_runs//3), color='steelblue',
-            edgecolor='white', lw=0.5)
-    ax.axvline(np.mean(slope_R_arr), color='firebrick', ls='--',
-               label=f'mean={np.mean(slope_R_arr):.3e}')
-    ax.set_xlabel('dR_M/dt  [code units / code time]')
-    ax.set_ylabel('Count')
-    ax.set_title('Distribution of orbital decay rate')
-    ax.legend(fontsize=7)
-
-    ax = axes[0, 1]
-    ax.hist(max_dE_arr, bins=max(5, n_runs//3), color='darkorange',
-            edgecolor='white', lw=0.5)
-    ax.axvline(1e-3, color='firebrick', ls='--', lw=1.0,
-               label='0.1% threshold')
-    ax.set_xlabel('max |ΔE/E₀|')
-    ax.set_ylabel('Count')
-    ax.set_title('Energy conservation per run')
-    ax.legend(fontsize=7)
-
-    ax = axes[1, 0]
-    ax.hist(virial_arr_comb, bins=max(5, n_runs//3), color='green',
-            edgecolor='white', lw=0.5)
-    ax.axvline(1.0, color='firebrick', ls='--', lw=1.0, label='virial = 1')
-    ax.set_xlabel('Mean 2K_bg / |W_bg|')
-    ax.set_ylabel('Count')
-    ax.set_title('Background virial ratio distribution')
-    ax.legend(fontsize=7)
-
-    ax = axes[1, 1]
-    valid_mask = np.isfinite(lnlam_med_arr)
-    if np.any(valid_mask):
-        ax.hist(lnlam_med_arr[valid_mask], bins=max(5, n_runs//3),
-                color='purple', edgecolor='white', lw=0.5)
-        ax.axvline(ln_lam_use, color='firebrick', ls='--',
-                   label=f'ln(1/η) = {ln_lam_use:.2f}')
-        ax.axvline(math.log(N_BG), color='darkorange', ls=':',
-                   label=f'ln(N) = {math.log(N_BG):.2f}')
-    ax.set_xlabel('Median ln Λ_eff per run')
-    ax.set_ylabel('Count')
-    ax.set_title('Effective Coulomb logarithm distribution')
-    ax.legend(fontsize=7)
-
-    plt.tight_layout()
-    fname = 'combined_scalar_distributions.pdf'
-    fig.savefig(fname, bbox_inches='tight')
-    plt.close(fig)
-    figs_written.append(fname)
-    print(f"    written: {fname}", flush=True)
-
-    # ---------- Figure C3: R_M(t_final) convergence ----------
-    fig, ax = plt.subplots(figsize=(7, 4))
-    # running mean as realisations are added
-    R_final_each = np.array([np.interp(t_common[-1], R_interp[i][0], R_interp[i][1])
-                              for i in range(n_runs)])
-    running_mean = np.cumsum(R_final_each) / np.arange(1, n_runs + 1)
-    running_se   = np.array([np.std(R_final_each[:k+1]) / math.sqrt(k+1)
-                              for k in range(n_runs)])
-    ax.plot(np.arange(1, n_runs + 1), running_mean, color='navy', lw=1.5,
-            label='Running mean of R_M(t_final)')
-    ax.fill_between(np.arange(1, n_runs + 1),
-                    running_mean - running_se,
-                    running_mean + running_se,
-                    color='steelblue', alpha=0.3, label='±1 S.E.')
-    ax.axhline(np.interp(t_common[-1], t_common, R_chandra_mean),
-               color='firebrick', ls='--', lw=1.0,
-               label='Chandrasekhar prediction')
-    ax.set_xlabel('Number of realisations included')
-    ax.set_ylabel('R_M(t_final)  [code units]')
-    ax.set_title(f'Ensemble convergence check  |  η={eta:.3f}')
-    ax.legend(fontsize=8)
-    plt.tight_layout()
-    fname = 'combined_ensemble_convergence.pdf'
-    fig.savefig(fname, bbox_inches='tight')
-    plt.close(fig)
-    figs_written.append(fname)
-    print(f"    written: {fname}", flush=True)
-
-    print(f"\n  Combined PDFs written: {len(figs_written)}", flush=True)
-    for f in figs_written:
-        print(f"    {f}", flush=True)
-    print(f"{'='*60}", flush=True)
-
-# ============================================================
-#  MAIN ENTRY POINT
-# ============================================================
-
-if args.combined:
-    # Mode B
-    run_combined_analysis(eta=ETA, R0_init=R0_ARG)
-elif args.run_dir is not None:
-    # Mode A
-    if not os.path.isdir(args.run_dir):
-        print(f"[ERROR] run_dir does not exist: {args.run_dir}", flush=True)
-        sys.exit(1)
-    run_single_analysis(run_dir=args.run_dir,
-                        eta=ETA,
-                        R0_init=R0_ARG,
-                        N_bg=N_BG,
-                        eps=EPS)
-else:
-    parser.print_help()
+times        = []
+R_M_arr      = [];  v_M_arr      = [];  Lz_M_arr  = [];  L_M_arr   = []
+E_orb_M_arr  = [];  x_M_traj     = [];  y_M_traj  = []
+K_bg_arr     = [];  W_bg_arr     = [];  E_tot_arr = []
+virial_arr   = [];  sigma_v_arr  = [];  sigma_vr_arr = []; sigma_vt_arr = []
+mean_vr_arr  = [];  r_cm_bg_arr  = [];  lagr_arr  = []
+
+r_max_bg = np.zeros(N_BG)
+r_min_bg = np.full(N_BG, np.inf)
+r_sum_bg = np.zeros(N_BG)
+n_orb    = 0
+
+pos_bg_initial = vel_bg_initial = phi_bg_initial = None
+pos_bg_last    = vel_bg_last    = phi_bg_last    = None
+
+E0_total = None
+snap_idx = 0
+
+print("pass 1: streaming snapshots...", flush=True)
+
+for t, pos, vel, phi in iter_snapshots(outfile, N_total):
+    pos_p  = pos[0];  vel_p  = vel[0];  phi_p  = phi[0]
+    pos_bg = pos[1:]; vel_bg = vel[1:]; phi_bg = phi[1:]
+
+    cm_bg   = np.mean(pos_bg, axis=0)
+    vcm_bg  = np.mean(vel_bg, axis=0)
+    dr_p    = pos_p - cm_bg
+    dv_p    = vel_p - vcm_bg
+    R_p     = float(np.linalg.norm(dr_p))
+    v_p_s   = float(np.linalg.norm(dv_p))
+    L_vec   = np.cross(dr_p, dv_p)
+    Lz_p    = float(L_vec[2])
+    L_p     = float(np.linalg.norm(L_vec))
+    E_orb_p = 0.5 * v_p_s**2 + phi_p
+
+    v2_bg  = np.sum(vel_bg**2, axis=1)
+    K_bg   = 0.5 * m_bg * float(np.sum(v2_bg))
+    W_bg   = 0.5 * m_bg * float(np.sum(phi_bg))
+    K_pert = 0.5 * M_p * v_p_s**2
+    E_tot  = K_bg + K_pert + 0.5 * (M_p * phi_p + m_bg * float(np.sum(phi_bg)))
+    if E0_total is None:
+        E0_total = E_tot
+    virial = -2.0 * K_bg / W_bg if abs(W_bg) > 1e-12 else 0.0
+
+    sv, svr, svt, mvr = velocity_stats(pos_bg, vel_bg)
+
+    r_bg      = np.linalg.norm(pos_bg - cm_bg, axis=1)
+    r_bg_sort = np.sort(r_bg)
+    lagr      = lagrangian_radii(r_bg_sort, N_BG)
+
+    r_max_bg  = np.maximum(r_max_bg, r_bg)
+    r_min_bg  = np.minimum(r_min_bg, r_bg)
+    r_sum_bg += r_bg
+    n_orb    += 1
+
+    times.append(t)
+    R_M_arr.append(R_p);         v_M_arr.append(v_p_s)
+    Lz_M_arr.append(Lz_p);       L_M_arr.append(L_p)
+    E_orb_M_arr.append(E_orb_p)
+    x_M_traj.append(float(pos_p[0])); y_M_traj.append(float(pos_p[1]))
+    K_bg_arr.append(K_bg);       W_bg_arr.append(W_bg);  E_tot_arr.append(E_tot)
+    virial_arr.append(virial);   sigma_v_arr.append(sv)
+    sigma_vr_arr.append(svr);    sigma_vt_arr.append(svt); mean_vr_arr.append(mvr)
+    r_cm_bg_arr.append(float(np.linalg.norm(cm_bg)))
+    lagr_arr.append(lagr)
+
+    if pos_bg_initial is None:
+        pos_bg_initial = pos_bg.copy()
+        vel_bg_initial = vel_bg.copy()
+        phi_bg_initial = phi_bg.copy()
+    pos_bg_last = pos_bg.copy()
+    vel_bg_last = vel_bg.copy()
+    phi_bg_last = phi_bg.copy()
+
+    snap_idx += 1
+    if snap_idx % 200 == 0:
+        print(f"  {snap_idx} snapshots...", flush=True)
+
+if snap_idx == 0:
+    print("[ERROR] no valid snapshots read")
     sys.exit(1)
+
+n_snaps = snap_idx
+print(f"pass 1 done: {n_snaps} snapshots  t=0..{times[-1]:.2f}")
+
+times         = np.array(times)
+R_M           = np.array(R_M_arr)
+v_M           = np.array(v_M_arr)
+Lz_M          = np.array(Lz_M_arr)
+L_M           = np.array(L_M_arr)
+E_orb_M       = np.array(E_orb_M_arr)
+x_M_traj      = np.array(x_M_traj)
+y_M_traj      = np.array(y_M_traj)
+K_bg_arr      = np.array(K_bg_arr)
+W_bg_arr      = np.array(W_bg_arr)
+E_tot_arr     = np.array(E_tot_arr)
+virial_arr    = np.array(virial_arr)
+sigma_v_arr   = np.array(sigma_v_arr)
+sigma_vr_arr  = np.array(sigma_vr_arr)
+sigma_vt_arr  = np.array(sigma_vt_arr)
+mean_vr_arr   = np.array(mean_vr_arr)
+r_cm_bg_arr   = np.array(r_cm_bg_arr)
+lagr_arr      = np.array(lagr_arr)
+
+# ============================================================
+#  DERIVED DIAGNOSTICS — PERTURBER
+# ============================================================
+
+dE_over_E0 = np.abs((E_tot_arr - E0_total) / E0_total)
+DK_bg      = K_bg_arr - K_bg_arr[0]
+dt_snap    = float(np.median(np.diff(times))) if n_snaps > 1 else 1.0
+dR_dt      = np.gradient(R_M, dt_snap)
+
+slope_R, *_ = stats.linregress(times, R_M)
+slope_L, *_ = stats.linregress(times, L_M)
+
+# ---- R-dependent Coulomb log along the actual trajectory ----
+ln_lam_R_arr = np.array([ln_lam_at_R(r) for r in R_M])
+
+# ---- Measured deceleration: -dL/dt / R ----
+# 1. Smooth the angular momentum to remove N-body noise
+L_M_smooth = gaussian_filter1d(L_M, sigma=4.0)
+
+# 2. Take the derivative of the smoothed curve
+dL_dt  = np.gradient(L_M_smooth, dt_snap)
+
+with np.errstate(divide='ignore', invalid='ignore'):
+    # We keep R_M > 0.05 just to prevent dividing by zero at the very center
+    a_meas = np.where(R_M > 0.05, -dL_dt / R_M, np.nan)
+
+# ---- Theory deceleration curves along the smoothed orbit ----
+# Using fixed global ln(1/eta) and using the R-dependent ln_Lambda(R)
+a_chandra_fixed = np.array([
+    chandrasekhar_decel(R_M[i], v_M[i], M_p, ln_lam)
+    for i in range(n_snaps)])
+
+a_chandra_Rdep = np.array([
+    chandrasekhar_decel(R_M[i], v_M[i], M_p, ln_lam_at_R(R_M[i]))
+    for i in range(n_snaps)])
+
+# ---- Effective Coulomb log: lnlam_eff = a_meas / (a_chandra at ln_lam=1) ----
+a_chandra_lam1 = np.array([
+    chandrasekhar_decel(R_M[i], v_M[i], M_p, 1.0)
+    for i in range(n_snaps)])
+
+with np.errstate(divide='ignore', invalid='ignore'):
+    # DROPPED THE MASK: We removed the (a_meas > 0) restriction here!
+    lnlam_eff = np.where(
+        (a_chandra_lam1 > 1e-12) & np.isfinite(a_meas),
+        a_meas / a_chandra_lam1, np.nan)
+
+# ---- Chandrasekhar ODE: quasi-circular inspiral dR/dt = -a_DF * R / dLdR ----
+# Two versions: fixed ln_Lambda = ln(1/eta), and R-dependent ln_Lambda(R).
+def _chandra_ode(use_R_dep_lnlam):
+    Rc    = np.empty(n_snaps)
+    Rc[0] = R_M[0]
+    for i in range(1, n_snaps):
+        R_prev = Rc[i - 1]
+        if R_prev < 0.01:
+            Rc[i] = R_prev
+            continue
+        vc   = plummer_vcirc(R_prev)
+        ll   = ln_lam_at_R(R_prev) if use_R_dep_lnlam else ln_lam
+        a_fc = chandrasekhar_decel(R_prev, max(vc, 0.01), M_p, ll)
+        dLdR = plummer_dLdR(R_prev)
+        dR   = -a_fc * R_prev / max(dLdR, 1e-10) * dt_snap
+        Rc[i] = max(0.01, R_prev + dR)
+    return Rc
+
+R_chandra       = _chandra_ode(use_R_dep_lnlam=False)   # fixed ln(1/eta)
+R_chandra_Rdep  = _chandra_ode(use_R_dep_lnlam=True)    # R-dependent
+
+# ============================================================
+#  DERIVED DIAGNOSTICS — BACKGROUND
+# ============================================================
+
+r_hm_t       = lagr_arr[:, 2]
+r_hm_initial = float(r_hm_t[0])
+r_hm_median  = float(np.median(r_hm_t))
+r_hm_offset  = (r_hm_median - r_hm) / r_hm
+virial_mean  = float(np.mean(virial_arr))
+virial_std   = float(np.std(virial_arr))
+sv_drift     = (float(sigma_v_arr[-1]) - float(sigma_v_arr[0])) / float(sigma_v_arr[0])
+energy_err   = float(np.max(dE_over_E0))
+is_good      = energy_err < 0.01
+
+print(f"R_M(0)={R_M[0]:.4f}  R_M(f)={R_M[-1]:.4f}  dR/dt={slope_R:.4e}")
+print(f"max|dE/E0|={energy_err:.2e}  virial={virial_mean:.4f}  r_hm_offset={100*r_hm_offset:+.2f}%")
+
+# ============================================================
+#  PASS 2 — MID SNAPSHOT
+# ============================================================
+
+t_mid_target  = times[-1] / 2.0
+pos_bg_mid    = vel_bg_mid = phi_bg_mid = None
+t_mid_actual  = np.inf
+best_mid_diff = np.inf
+
+print("pass 2: mid snapshot...", flush=True)
+
+for t, pos, vel, phi in iter_snapshots(outfile, N_total):
+    pos_bg = pos[1:]
+    diff = abs(t - t_mid_target)
+    if diff < best_mid_diff:
+        best_mid_diff = diff
+        t_mid_actual  = t
+        pos_bg_mid    = pos_bg.copy()
+        vel_bg_mid    = vel[1:].copy()
+        phi_bg_mid    = phi[1:].copy()
+
+print(f"pass 2 done.  mid snapshot at t={t_mid_actual:.4f}")
+
+# ============================================================
+#  GOODNESS-OF-FIT TESTS  (final background snapshot)
+# ============================================================
+
+cm_last = np.mean(pos_bg_last, axis=0)
+r_last  = np.linalg.norm(pos_bg_last - cm_last, axis=1)
+
+# 1. density chi2
+bins_chi    = np.logspace(np.log10(2.0 * EPS), 1.5, 25)
+cnt_chi, edges_chi = np.histogram(r_last, bins=bins_chi)
+r_mid_chi   = np.sqrt(edges_chi[:-1] * edges_chi[1:])
+vol_chi     = (4.0 / 3.0) * np.pi * (edges_chi[1:]**3 - edges_chi[:-1]**3)
+rho_sim_chi = cnt_chi * m_bg / vol_chi
+rho_th_chi  = np.array([plummer_rho(r) for r in r_mid_chi])
+cnt_th_chi  = rho_th_chi * vol_chi / m_bg
+sigma_rho   = rho_th_chi / np.sqrt(np.maximum(cnt_th_chi, 1))
+chi2_rho, p_rho = compute_reduced_chi2(rho_sim_chi, rho_th_chi, sigma_rho)
+
+# 2. KS test
+ks_stat, p_ks = stats.kstest(r_last, plummer_cdf)
+
+# 3. P(q) chi2
+if phi_bg_last is not None:
+    v_mag_chi = np.linalg.norm(vel_bg_last, axis=1)
+    v_esc_chi = np.sqrt(np.maximum(-2.0 * phi_bg_last, 0.0))
+    valid_chi = (v_esc_chi > 0) & (v_mag_chi / np.where(v_esc_chi > 0, v_esc_chi, 1.0) < 0.98)
+    q_sim_chi = (v_mag_chi / v_esc_chi)[valid_chi]
+    qc, qe    = np.histogram(q_sim_chi, bins=25)
+    qm        = 0.5 * (qe[:-1] + qe[1:])
+    q_th_chi  = qm**2 * (1.0 - qm**2)**3.5
+    q_th_chi *= len(q_sim_chi) / np.sum(q_th_chi)
+    chi2_q, p_q = compute_reduced_chi2(qc, q_th_chi,
+                                        np.sqrt(np.maximum(q_th_chi, 1)), dof_adj=1)
+    has_q = True
+else:
+    chi2_q = p_q = np.nan
+    has_q = False
+
+# 4. Jeans chi2
+r_mid_jchi, sigr_chi, sigt_chi, _, cnt_jchi = jeans_profile(pos_bg_last, vel_bg_last)
+sig_th_jchi  = sigma_theory_jeans(r_mid_jchi)
+sig_err_jchi = sig_th_jchi / np.sqrt(2.0 * np.maximum(cnt_jchi - 1, 1))
+chi2_sigr, p_sigr = compute_reduced_chi2(sigr_chi, sig_th_jchi, sig_err_jchi)
+chi2_sigt, p_sigt = compute_reduced_chi2(sigt_chi, sig_th_jchi, sig_err_jchi)
+
+# ============================================================
+#  BACKGROUND FIGURES
+# ============================================================
+
+# BG1: dropped (plain scatter snapshots replaced by KDE density panels in perturber plot)
+
+# BG2: dropped (core / half-mass / halo orbital rosettes removed)
+
+# BG3: density profile initial / mid / final
+r_theory    = np.logspace(-1.5, 1.5, 300)
+rho_th_plot = np.array([plummer_rho(r) for r in r_theory])
+
+fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+for ax, pos_s, label in [
+        (axes[0], pos_bg_initial, 't=0'),
+        (axes[1], pos_bg_mid,     f't={t_mid_actual:.2f}'),
+        (axes[2], pos_bg_last,    f't={times[-1]:.2f}')]:
+    r_m, rho_m, cnts = bin_density_profile(pos_s)
+    if r_m is not None:
+        log_sig = 1.0 / np.sqrt(cnts)
+        ax.errorbar(r_m, rho_m,
+                    yerr=[rho_m * (1.0 - 10.0**(-log_sig)),
+                          rho_m * (10.0**log_sig - 1.0)],
+                    fmt='o', ms=3, color='k', label='N-body')
+    ax.plot(r_theory, rho_th_plot, 'r--', label='Plummer theory')
+    ax.set_xscale('log'); ax.set_yscale('log')
+    ax.set_xlabel('r'); ax.set_title(label); ax.legend(fontsize=7)
+axes[0].set_ylabel('density')
+plt.tight_layout()
+fname = os.path.join(run_dir, 'plot_bg_density.pdf')
+fig.savefig(fname, bbox_inches='tight'); plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# BG4: cumulative mass and circular velocity
+r_th_vc = np.logspace(-2, 1.5, 500)
+M_th_vc = np.array([plummer_mass_enc(r) for r in r_th_vc])
+vc_th   = np.sqrt(G * M_th_vc / r_th_vc)
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+for col, (pos_s, label) in enumerate([
+        (pos_bg_initial, 't=0'),
+        (pos_bg_last,    f't={times[-1]:.2f}')]):
+    cm_s    = np.mean(pos_s, axis=0)
+    r_s     = np.sort(np.linalg.norm(pos_s - cm_s, axis=1))
+    M_cum   = np.arange(1, N_BG + 1) * m_bg
+    mask_vc = r_s > 0.01
+    r_vc    = r_s[mask_vc]
+    vcirc_s = np.sqrt(G * M_cum[mask_vc] / r_vc)
+    axes[0, col].plot(r_th_vc, vc_th, 'r--', label='Plummer theory')
+    axes[0, col].plot(r_vc, vcirc_s, color='k', lw=0.8, label='N-body')
+    axes[0, col].set_title(f'v_circ  {label}')
+    axes[0, col].set_xlabel('r'); axes[0, col].set_xscale('log')
+    axes[0, col].set_xlim(r_th_vc[0], r_th_vc[-1]); axes[0, col].legend(fontsize=7)
+    axes[1, col].plot(r_th_vc, M_th_vc, 'r--', label='theory')
+    axes[1, col].plot(r_vc, M_cum[mask_vc], color='k', lw=0.8, label='N-body')
+    axes[1, col].axhline(M_tot, color='k', ls=':', lw=0.8, label='M_tot')
+    axes[1, col].set_title(f'M(<r)  {label}')
+    axes[1, col].set_xlabel('r'); axes[1, col].set_xscale('log')
+    axes[1, col].set_xlim(r_th_vc[0], r_th_vc[-1]); axes[1, col].legend(fontsize=7)
+axes[0, 0].set_ylabel('v_circ')
+axes[1, 0].set_ylabel('M(<r)')
+plt.tight_layout()
+fname = os.path.join(run_dir, 'plot_bg_mass_vcirc.pdf')
+fig.savefig(fname, bbox_inches='tight'); plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# BG5: velocity distribution P(q)
+if phi_bg_initial is not None and phi_bg_last is not None:
+    q_theory = np.linspace(0, 1, 300)
+    p_theory = q_theory**2 * (1.0 - q_theory**2)**3.5
+    p_theory /= np.trapezoid(p_theory, q_theory)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+    for ax, label, vel_s, phi_s in [
+            (axes[0], 't=0',                 vel_bg_initial, phi_bg_initial),
+            (axes[1], f't={times[-1]:.2f}',  vel_bg_last,    phi_bg_last)]:
+        v_mag = np.linalg.norm(vel_s, axis=1)
+        v_esc = np.sqrt(np.maximum(-2.0 * phi_s, 0.0))
+        q_sim = np.where(v_esc > 0, v_mag / v_esc, 1.0)
+        q_sim = q_sim[q_sim < 1.0]
+        ax.hist(q_sim, bins=40, density=True, color='k', alpha=0.6, label='N-body')
+        ax.plot(q_theory, p_theory, 'r-', label='q^2(1-q^2)^(7/2)')
+        ax.set_xlabel('q = v / v_esc'); ax.set_ylabel('pdf')
+        ax.set_title(label); ax.legend(fontsize=7)
+    plt.tight_layout()
+    fname = os.path.join(run_dir, 'plot_bg_vel_dist.pdf')
+    fig.savefig(fname, bbox_inches='tight'); plt.close(fig)
+    print(f"written: {os.path.basename(fname)}")
+
+# BG6: Jeans equation
+fig, axes = plt.subplots(2, 2, figsize=(12, 8),
+                          gridspec_kw={'height_ratios': [3, 1]})
+for col, (pos_s, vel_s, label) in enumerate([
+        (pos_bg_initial, vel_bg_initial, 't=0'),
+        (pos_bg_last,    vel_bg_last,    f't={times[-1]:.2f}')]):
+    ax_top = axes[0, col]
+    ax_bot = axes[1, col]
+    r_mid_j, sig_r_j, sig_t_j, ratio_j, cnt_j = jeans_profile(pos_s, vel_s)
+    valid = ~np.isnan(sig_r_j)
+    if valid.any():
+        r_th_j = np.logspace(np.log10(r_mid_j[valid].min()),
+                              np.log10(r_mid_j[valid].max()), 200)
+        ax_top.plot(r_th_j, sigma_theory_jeans(r_th_j), 'r--', label='Jeans theory')
+    sig_err_j = sigma_theory_jeans(r_mid_j) / np.sqrt(2.0 * np.maximum(cnt_j - 1, 1))
+    ax_top.errorbar(r_mid_j, sig_r_j, yerr=sig_err_j, fmt='o', ms=3, color='k', label='sigma_r')
+    ax_top.errorbar(r_mid_j, sig_t_j, yerr=sig_err_j, fmt='s', ms=3, color='0.5', label='sigma_t')
+    ax_top.set_xscale('log')
+    ax_top.set_ylabel('sigma'); ax_top.set_title(label); ax_top.legend(fontsize=7)
+    ax_bot.axhline(1.0, color='r', ls='--', lw=0.8, label='sigma_t/sigma_r = 1')
+    ax_bot.scatter(r_mid_j, ratio_j, s=15, color='k')
+    ax_bot.set_xscale('log'); ax_bot.set_ylim(0.5, 1.5)
+    ax_bot.set_xlabel('r'); ax_bot.set_ylabel('sigma_t / sigma_r'); ax_bot.legend(fontsize=7)
+plt.tight_layout()
+fname = os.path.join(run_dir, 'plot_bg_jeans.pdf')
+fig.savefig(fname, bbox_inches='tight'); plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# BG7: Lagrangian radii vs time
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+for k, frac in enumerate(LAG_FRACS):
+    label = f'r_{int(frac*100)}%  (th={LAG_THEORY[k]:.3f})'
+    axes[0].plot(times, lagr_arr[:, k], lw=1.0, label=label)
+    axes[0].axhline(LAG_THEORY[k], ls='--', lw=0.6, alpha=0.5)
+    axes[1].plot(times, lagr_arr[:, k] / lagr_arr[0, k],
+                 lw=1.0, label=f'r_{int(frac*100)}%')
+axes[0].axhline(r_hm, color='k', ls=':', lw=0.8)
+axes[0].set_xlabel('t'); axes[0].set_ylabel('Lagrangian radius')
+axes[0].set_title('absolute  (dashed = theory)'); axes[0].legend(fontsize=7)
+axes[1].axhline(1.0, color='k', ls='--', lw=0.8, label='= 1')
+axes[1].set_xlabel('t'); axes[1].set_ylabel('r / r(t=0)')
+axes[1].set_title('normalised  (= 1 means stable)'); axes[1].legend(fontsize=7)
+plt.tight_layout()
+fname = os.path.join(run_dir, 'plot_bg_lagrangian.pdf')
+fig.savefig(fname, bbox_inches='tight'); plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# BG8: velocity diagnostics vs time
+fig, axes = plt.subplots(1, 3, figsize=(14, 5))
+axes[0].plot(times, virial_arr, color='k', lw=1.0, label='2K/|W|')
+axes[0].axhline(1.0, color='k', ls='--', lw=0.8, label='= 1')
+axes[0].axhline(virial_mean, color='k', ls=':', lw=0.8, label=f'mean={virial_mean:.4f}')
+axes[0].set_ylim(0.8, 1.2)
+axes[0].set_xlabel('t'); axes[0].set_ylabel('2K / |W|')
+axes[0].set_title('virial ratio'); axes[0].legend(fontsize=7)
+axes[1].plot(times, sigma_v_arr,  color='k',   lw=1.0, label='sigma_v total')
+axes[1].plot(times, sigma_vr_arr, color='0.4', lw=0.8, ls='--', label='sigma_vr')
+axes[1].plot(times, sigma_vt_arr, color='0.6', lw=0.8, ls=':',  label='sigma_vt')
+axes[1].axhline(sv_theory, color='r', ls='--', lw=0.8, label=f'theory={sv_theory:.4f}')
+axes[1].set_xlabel('t'); axes[1].set_ylabel('velocity dispersion')
+axes[1].set_title('velocity dispersion'); axes[1].legend(fontsize=7)
+axes[2].plot(times, mean_vr_arr, color='k', lw=1.0, label='<v_r>')
+axes[2].axhline(0.0, color='k', ls='--', lw=0.8, label='= 0')
+axes[2].set_xlabel('t'); axes[2].set_ylabel('<v_r>')
+axes[2].set_title('mean radial velocity  (should be ~0)'); axes[2].legend(fontsize=7)
+plt.tight_layout()
+fname = os.path.join(run_dir, 'plot_bg_velocities.pdf')
+fig.savefig(fname, bbox_inches='tight'); plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# BG9: energy distribution bound/unbound (final snapshot)
+if phi_bg_last is not None:
+    E_final   = 0.5 * np.sum(vel_bg_last**2, axis=1) + phi_bg_last
+    n_unbound = int(np.sum(E_final > 0))
+    n_bound   = N_BG - n_unbound
+    fig, ax = plt.subplots(figsize=(7, 5))
+    ax.hist(E_final[E_final <= 0], bins=50, color='k',   alpha=0.6, label=f'bound ({n_bound})')
+    ax.hist(E_final[E_final > 0],  bins=50, color='0.5', alpha=0.6, label=f'unbound ({n_unbound})')
+    ax.axvline(0, color='k', ls='--', lw=0.8, label='E=0')
+    ax.set_xlabel('specific energy  (0.5*v^2 + phi)')
+    ax.set_ylabel('N particles')
+    ax.set_title(f'bound vs unbound  t={times[-1]:.2f}  ({100*n_unbound/N_BG:.2f}% unbound)')
+    ax.legend(fontsize=7)
+    plt.tight_layout()
+    fname = os.path.join(run_dir, 'plot_bg_energy.pdf')
+    fig.savefig(fname, bbox_inches='tight'); plt.close(fig)
+    print(f"written: {os.path.basename(fname)}")
+
+# ============================================================
+#  PERTURBER FIGURES
+# ============================================================
+
+# P1: orbital decay — 4 panels
+fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+
+ax = axes[0, 0]
+ax.plot(times, R_M, color='k', lw=0.8, label='R_M(t)')
+ax.plot(times, R_chandra, color='r', lw=1.5, ls='--',
+        label=f'Chandra fixed ln={ln_lam:.2f}')
+ax.plot(times, R_chandra_Rdep, color='b', lw=1.5, ls='-.',
+        label='Chandra R-dep ln(M(<R)/M_p)')
+ax.axhline(r_hm, color='k', ls=':', lw=0.8, label='r_hm')
+ax.set_xlabel('t'); ax.set_ylabel('R_M')
+ax.set_title('orbital radius decay'); ax.legend(fontsize=7)
+
+ax = axes[0, 1]
+ax.plot(times, L_M, color='k', lw=0.8, label='|L_M|')
+ax.plot(times, Lz_M, color='0.5', lw=0.6, alpha=0.6, label='L_z')
+ax.set_xlabel('t'); ax.set_ylabel('specific angular momentum')
+ax.set_title('angular momentum loss'); ax.legend(fontsize=7)
+
+ax = axes[1, 0]
+ax.plot(times, v_M, color='k', lw=0.8, label='|v_M|')
+vc_theory_arr = np.array([plummer_vcirc(r) for r in R_M])
+ax.plot(times, vc_theory_arr, color='r', lw=1.2, ls='--', label='v_circ theory')
+ax.set_xlabel('t'); ax.set_ylabel('speed')
+ax.set_title('speed vs circular velocity'); ax.legend(fontsize=7)
+
+ax = axes[1, 1]
+a_Rdep_plot = np.where(a_chandra_Rdep > 0, a_chandra_Rdep, np.nan)
+
+# Plot the smoothed measurement directly!
+ax.plot(times, a_meas, color='k', lw=0.8, alpha=0.7,
+        label=r'$-\dot{L}/R$  (smoothed)')
+ax.plot(times, a_chandra_fixed, color='r', lw=1.5, ls='--',
+        label=f'Chandra fixed ln={ln_lam:.2f}')
+ax.plot(times, a_Rdep_plot, color='b', lw=1.5, ls='-.',
+        label='Chandra R-dep ln(M(<R)/M_p)')
+
+# Safely calculate y-limits ignoring any remaining tiny negative values
+valid_a_meas = a_meas[a_meas > 0] if np.any(a_meas > 0) else []
+all_pos = np.concatenate([valid_a_meas,
+                           a_chandra_fixed[a_chandra_fixed > 0],
+                           a_Rdep_plot[np.isfinite(a_Rdep_plot)]])
+if len(all_pos):
+    ax.set_ylim(all_pos.min() * 0.3, all_pos.max() * 3.0)
+    
+ax.set_xlabel('t'); ax.set_ylabel('deceleration')
+ax.set_title('friction deceleration  (-dL/dt / R)')
+ax.set_yscale('log'); ax.legend(fontsize=7)
+
+plt.tight_layout()
+fname = os.path.join(run_dir, 'plot_orbital_decay.pdf')
+fig.savefig(fname, bbox_inches='tight'); plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# P2: energetics
+fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+ax = axes[0]
+ax.plot(times, dE_over_E0, color='k', lw=1.0)
+ax.axhline(1e-3, color='k', ls='--', lw=0.8, label='0.1%')
+ax.set_xlabel('t'); ax.set_ylabel('|dE/E0|')
+ax.set_title('energy conservation'); ax.set_yscale('log'); ax.legend(fontsize=7)
+
+ax = axes[1]
+ax.plot(times, E_orb_M - E_orb_M[0], color='k',   lw=1.2, label='dE_orb perturber')
+ax.plot(times, DK_bg,                 color='0.5', lw=1.2, label='DK_bg background')
+ax.plot(times, (E_orb_M - E_orb_M[0]) + DK_bg,
+        color='0.7', lw=1.0, ls='--', label='sum')
+ax.axhline(0, color='k', lw=0.5)
+ax.set_xlabel('t'); ax.set_ylabel('energy change')
+ax.set_title('energy partitioning'); ax.legend(fontsize=7)
+
+plt.tight_layout()
+fname = os.path.join(run_dir, 'plot_energetics.pdf')
+fig.savefig(fname, bbox_inches='tight'); plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# P3: perturber trajectory
+fig, ax = plt.subplots(figsize=(5, 5))
+sc = ax.scatter(x_M_traj, y_M_traj, c=times, s=1.5, cmap='viridis')
+plt.colorbar(sc, ax=ax, label='t')
+ax.set_aspect('equal')
+ax.set_xlabel('x'); ax.set_ylabel('y'); ax.set_title('perturber trajectory')
+ax.add_patch(plt.Circle((0, 0), r_hm, color='gray', fill=False,
+                         ls='--', lw=0.8, label='r_hm'))
+ax.legend(fontsize=7)
+plt.tight_layout()
+fname = os.path.join(run_dir, 'plot_orbit_wake.pdf')
+fig.savefig(fname, bbox_inches='tight'); plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# P4: Coulomb logarithm — measured vs two theoretical predictions
+ln_lam_R_theory = np.array([ln_lam_at_R(r) for r in R_M])
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+
+ax = axes[0]
+ax.plot(times, lnlam_eff, color='k', lw=0.8, alpha=0.7,
+        label='measured  (-dL/dt / R) / a_DF(ln=1)')
+ln_theory_pos = np.where(ln_lam_R_theory > 0, ln_lam_R_theory, np.nan)
+ax.plot(times, ln_theory_pos, color='b', lw=1.2, ls='-.',
+        label='theory  ln(M(<R)/M_p)')
+ax.axhline(ln_lam, color='r', ls='--', lw=1.0, label=f'ln(1/eta)={ln_lam:.2f}')
+ax.set_xlabel('t'); ax.set_ylabel('ln Lambda')
+ax.set_title('Coulomb logarithm vs time')
+ax.set_ylim(0, ln_lam * 1.4); ax.legend(fontsize=7)
+
+ax = axes[1]
+finite = np.isfinite(lnlam_eff)
+ax.plot(R_M[finite], lnlam_eff[finite], '.', color='k', ms=2, alpha=0.5,
+        label='measured')
+r_plot = np.linspace(0.01, R_M.max() * 1.05, 400)
+ln_plot = np.array([ln_lam_at_R(r) for r in r_plot])
+ax.plot(r_plot[ln_plot > 0], ln_plot[ln_plot > 0], color='b', lw=1.2, ls='-.',
+        label='theory  ln(M(<R)/M_p)')
+ax.axhline(ln_lam, color='r', ls='--', lw=1.0, label=f'ln(1/eta)={ln_lam:.2f}')
+ax.set_xlabel('R_M'); ax.set_ylabel('ln Lambda')
+ax.set_xlim(0, R_M.max() * 1.05)
+ax.set_ylim(0, ln_lam * 1.4)
+ax.set_title('Coulomb logarithm vs orbital radius'); ax.legend(fontsize=7)
+
+plt.tight_layout()
+fname = os.path.join(run_dir, 'plot_coulomb_log.pdf')
+fig.savefig(fname, bbox_inches='tight'); plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# ============================================================
+#  SUMMARY PRINT
+# ============================================================
+
+n_unbound_val = (int(np.sum((0.5 * np.sum(vel_bg_last**2, axis=1) + phi_bg_last) > 0))
+                 if phi_bg_last is not None else -1)
+
+lnlam_eff_med = float(np.nanmedian(lnlam_eff))
+
+print(f"\nSTATISTICAL GOODNESS-OF-FIT  (background, final snapshot t={times[-1]:.2f})")
+print(f"  rho(r)    chi2_nu={chi2_rho:6.3f}  p={p_rho:.4f}"
+      f"  [Pearson, sigma=E-based, r>2eps]")
+print(f"  CDF(r)    KS D   ={ks_stat:6.4f}  p={p_ks:.4f}"
+      f"  [KS test on raw radii vs Plummer CDF]")
+if has_q:
+    print(f"  P(q)      chi2_nu={chi2_q:6.3f}  p={p_q:.4f}"
+          f"  [Pearson, sigma=sqrt(E), dof_adj=1]")
+print(f"  sigma_r   chi2_nu={chi2_sigr:6.3f}  p={p_sigr:.4f}"
+      f"  [sigma=sigma_th/sqrt(2(n-1))]")
+print(f"  sigma_t   chi2_nu={chi2_sigt:6.3f}  p={p_sigt:.4f}")
+
+print(f"\n{'='*65}")
+print(f"  Snapshots:              {n_snaps}")
+print(f"  Time span:              {times[-1]:.4f}  ({times[-1]/t_dyn:.1f} t_dyn)")
+print(f"  r_hm(t=0):              {r_hm_initial:.4f}  (theory = {r_hm:.4f})")
+print(f"  r_hm offset:            {100*r_hm_offset:+.2f}%")
+print(f"  sigma_v(t=0):           {sigma_v_arr[0]:.4f}  (theory = {sv_theory:.4f})")
+print(f"  sigma_v drift:          {100*sv_drift:+.2f}%")
+print(f"  Mean 2K/|W|:            {virial_mean:.4f} +/- {virial_std:.4f}")
+print(f"  Max |dE/E0|:            {energy_err:.2e}  ({'PASS' if is_good else 'FAIL'})")
+if n_unbound_val >= 0:
+    print(f"  Unbound particles:      {n_unbound_val} / {N_BG}  ({100*n_unbound_val/N_BG:.2f}%)")
+print(f"  R_M(0) -> R_M(f):       {R_M[0]:.4f} -> {R_M[-1]:.4f}  (dR/dt={slope_R:.3e})")
+print(f"  ln_Lambda_eff (median): {lnlam_eff_med:.3f}")
+print(f"  ln_Lambda fixed:        {ln_lam:.3f}  [= ln(1/eta)]")
+print(f"  ln_Lambda(R_M(0)):      {ln_lam_at_R(R_M[0]):.3f}  [= ln(M(<R0)/M_p)]")
+print(f"  ln_Lambda(R_M(f)):      {ln_lam_at_R(R_M[-1]):.3f}  [at final radius]")
+print(f"  DK_bg / K_bg(0):        {DK_bg[-1]/K_bg_arr[0]:.4f}")
+print('='*65)
+
+# ============================================================
+#  SAVE NPZ
+# ============================================================
+
+E_final_bg = (0.5 * np.sum(vel_bg_last**2, axis=1) + phi_bg_last
+               if phi_bg_last is not None else np.full(N_BG, np.nan))
+
+lag_keys = {f"lag_{int(f*100):02d}": lagr_arr[:, k]
+            for k, f in enumerate(LAG_FRACS)}
+
+np.savez(
+    os.path.join(run_dir, 'perturber_stats.npz'),
+    # parameters
+    eta=np.float64(ETA),        R0_init=np.float64(R0_ARG),
+    N_bg=np.int64(N_BG),        eps=np.float64(EPS),
+    ln_lam=np.float64(ln_lam),  E0_total=np.float64(E0_total),
+    # time axis
+    times=times,
+    # perturber time series
+    R_M=R_M,             v_M=v_M,         Lz_M=Lz_M,
+    L_M=L_M,             E_orb_M=E_orb_M,
+    dR_dt=dR_dt,         R_chandra=R_chandra,
+    R_chandra_Rdep=R_chandra_Rdep,
+    lnlam_eff=lnlam_eff, ln_lam_R_arr=ln_lam_R_arr,
+    a_meas=a_meas,
+    a_chandra_fixed=a_chandra_fixed, a_chandra_Rdep=a_chandra_Rdep,
+    # background time series
+    K_bg=K_bg_arr,       W_bg=W_bg_arr,   E_tot=E_tot_arr,
+    virial=virial_arr,   sigma_v=sigma_v_arr,
+    sigma_vr=sigma_vr_arr, sigma_vt=sigma_vt_arr,
+    mean_vr=mean_vr_arr, r_cm_bg=r_cm_bg_arr,
+    dE_over_E0=dE_over_E0, DK_bg=DK_bg,
+    # scalars
+    slope_R=np.float64(slope_R),        slope_L=np.float64(slope_L),
+    max_dE=np.float64(energy_err),      is_good=np.bool_(is_good),
+    mean_virial=np.float64(virial_mean), std_virial=np.float64(virial_std),
+    r_hm_median=np.float64(r_hm_median), r_hm_offset=np.float64(r_hm_offset),
+    sigma_v_drift=np.float64(sv_drift),
+    lnlam_eff_median=np.float64(lnlam_eff_med),
+    ln_lam_R0=np.float64(ln_lam_at_R(R_M[0])),
+    ln_lam_Rf=np.float64(ln_lam_at_R(R_M[-1])),
+    DK_bg_frac=np.float64(DK_bg[-1] / K_bg_arr[0]),
+    # goodness-of-fit
+    chi2_rho=np.float64(chi2_rho),   p_rho=np.float64(p_rho),
+    ks_stat=np.float64(ks_stat),     p_ks=np.float64(p_ks),
+    chi2_q=np.float64(chi2_q),       p_q=np.float64(p_q),
+    chi2_sigr=np.float64(chi2_sigr), p_sigr=np.float64(p_sigr),
+    chi2_sigt=np.float64(chi2_sigt), p_sigt=np.float64(p_sigt),
+    E_final_bg=E_final_bg,
+    **lag_keys,
+)
+print(f"saved: perturber_stats.npz")
