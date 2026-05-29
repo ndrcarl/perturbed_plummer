@@ -9,6 +9,15 @@
 #   energy conservation, energy partitioning, trajectory, Coulomb logarithm.
 #
 # python3 summary_perturber.py <run_dir> --eta E --R0 R --N N [--eps EPS]
+#
+# Changes vs original (audit recommendations M4 and M5):
+#   [ADD M4] B(X(t)) diagnostic: Chandrasekhar bracket along the orbit, showing
+#            how the DF efficiency departs from the SIS value of 0.4 over time.
+#            Added to plot_orbital_decay.pdf as a 5th panel (own row).
+#            Also saved as B_X_arr and X_arr in perturber_stats.npz.
+#   [ADD M5] Lz/|L| diagnostic: ratio of z-component to total angular momentum,
+#            monitoring orbital plane stability. Added to plot_orbital_decay.pdf.
+#            Also saved as Lz_over_L in perturber_stats.npz.
 
 import numpy as np
 import matplotlib
@@ -295,6 +304,7 @@ R_M_arr = []
 v_M_arr = []
 Lz_M_arr = []
 L_M_arr = []
+Lz_over_L_arr = []                                        # [ADD M5]
 E_orb_M_arr = []
 x_M_traj = []
 y_M_traj = []
@@ -366,6 +376,7 @@ for t, pos, vel, phi in iter_snapshots(outfile, N_total):
     v_M_arr.append(v_p_s)
     Lz_M_arr.append(Lz_p)
     L_M_arr.append(L_p)
+    Lz_over_L_arr.append(Lz_p / L_p if L_p > 1e-12 else np.nan)  # [ADD M5]
     E_orb_M_arr.append(E_orb_p)
     x_M_traj.append(float(pos_p[0]))
     y_M_traj.append(float(pos_p[1]))
@@ -404,6 +415,7 @@ R_M = np.array(R_M_arr)
 v_M = np.array(v_M_arr)
 Lz_M = np.array(Lz_M_arr)
 L_M = np.array(L_M_arr)
+Lz_over_L = np.array(Lz_over_L_arr)                      # [ADD M5]
 E_orb_M = np.array(E_orb_M_arr)
 x_M_traj = np.array(x_M_traj)
 y_M_traj = np.array(y_M_traj)
@@ -432,6 +444,24 @@ slope_L, *_ = stats.linregress(times, L_M)
 
 # R-dependent Coulomb log along the actual trajectory
 ln_lam_R_arr = np.array([ln_lam_at_R(R_M[i], v_M[i]) for i in range(n_snaps)])
+
+# [ADD M4] Chandrasekhar bracket B(X) and argument X along the trajectory.
+# X = v_M / (sqrt(2)*sigma(R)),  B(X) = erf(X) - (2X/sqrt(pi))*exp(-X^2).
+# For the SIS, v_circ = sqrt(2)*sigma so X=1 and B≈0.4 everywhere.
+# For Plummer, X(R) varies — this plot shows where and how much the DF
+# efficiency departs from the SIS approximation.
+def _compute_B_X():
+    X_arr = np.empty(n_snaps)
+    B_arr = np.empty(n_snaps)
+    for i in range(n_snaps):
+        sig2 = G * M_tot / (6.0 * math.sqrt(R_M[i]**2 + b**2))
+        sigma = math.sqrt(sig2)
+        X = v_M[i] / (math.sqrt(2.0) * sigma) if sigma > 0 else 0.0
+        X_arr[i] = X
+        B_arr[i] = chandrasekhar_bracket(X) if X > 0 else 0.0
+    return X_arr, B_arr
+
+X_arr, B_X_arr = _compute_B_X()                           # [ADD M4]
 
 # Measured deceleration: -dL/dt / R
 # Smooth L first to remove N-body noise, then differentiate.
@@ -799,8 +829,10 @@ if phi_bg_last is not None:
 #  PERTURBER FIGURES
 # ============================================================
 
-# P1: orbital decay — 4 panels
-fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+# P1: orbital decay — 6 panels (2 original + 2 original + 2 new diagnostics)
+# [ADD M4] row 2 left:  B(X(t)) — Chandrasekhar bracket efficiency along orbit
+# [ADD M5] row 2 right: Lz/|L| — orbital plane stability
+fig, axes = plt.subplots(3, 2, figsize=(11, 12))
 
 ax = axes[0, 0]
 ax.plot(times, R_M, color="k", lw=0.8, label="R_M(t)")
@@ -846,6 +878,42 @@ ax.set_xlabel("t")
 ax.set_ylabel("deceleration")
 ax.set_title("friction deceleration  (-dL/dt / R)")
 ax.set_yscale("log")
+ax.legend(fontsize=7)
+
+# [ADD M4] Chandrasekhar bracket B(X(t)) along the orbit.
+# Physics: B(X) = erf(X) - (2X/sqrt(pi))*exp(-X^2) is the fraction of
+# background particles slower than v_M; it sets the DF efficiency.
+# For the SIS: v_circ = sqrt(2)*sigma => X=1 everywhere => B≈0.4 (constant).
+# For the Plummer sphere X(R) varies, so this plot shows exactly how much
+# the Plummer DF departs from the SIS approximation along the inspiral.
+ax = axes[2, 0]
+ax.plot(times, B_X_arr, color="k", lw=0.8, label="B(X(t))")
+ax.plot(times, X_arr,   color="0.5", lw=0.6, ls="--", alpha=0.8, label="X(t)  [right scale]")
+ax.axhline(0.4, color="b", ls=":", lw=1.0,
+           label="B=0.4  (SIS reference,  X=1)")
+ax.axhline(1.0, color="0.7", ls=":", lw=0.8)
+ax.set_xlabel("t")
+ax.set_ylabel("B(X) / X")
+ax.set_title("Chandrasekhar bracket  B(X)  and  X = v_M / (√2 σ)")
+ax.set_ylim(0, max(X_arr.max() * 1.1, 1.5))
+ax.legend(fontsize=7)
+
+# [ADD M5] Lz / |L|: orbital plane stability.
+# At t=0 the perturber orbits in the x-y plane so Lz/|L|=1.
+# Any drift from unity means the orbital plane is precessing due to
+# N-body noise from the granular background.  A large drift invalidates
+# the quasi-circular 2D analysis of dL/dt.
+ax = axes[2, 1]
+ax.plot(times, Lz_over_L, color="k", lw=0.8, label=r"$L_z\,/\,|L|$")
+ax.axhline(1.0, color="b", ls=":", lw=0.8, label="1.0 (initial value)")
+ax.axhline(0.95, color="0.5", ls="--", lw=0.7, label="0.95 (5% threshold)")
+ax.set_xlabel("t")
+ax.set_ylabel(r"$L_z\,/\,|L|$")
+ax.set_title("orbital plane stability  (1 = orbit stays in x-y plane)")
+ax.set_ylim(
+    min(float(np.nanmin(Lz_over_L)) * 0.95, 0.85),
+    1.05,
+)
 ax.legend(fontsize=7)
 
 plt.tight_layout()
@@ -1009,6 +1077,9 @@ print(f"  ln_Lambda_eff (median): {lnlam_eff_med:.3f}")
 print(f"  ln_Lambda(R_M(0)):      {ln_lam_at_R(R_M[0]):.3f}  [= ln(M(<R0)/M_p)]")
 print(f"  ln_Lambda(R_M(f)):      {ln_lam_at_R(R_M[-1]):.3f}  [at final radius]")
 print(f"  DK_bg / K_bg(0):        {DK_bg[-1] / K_bg_arr[0]:.4f}")
+print(f"  B(X) at t=0:            {B_X_arr[0]:.4f}  (SIS ref = 0.400,  X={X_arr[0]:.3f})")   # [ADD M4]
+print(f"  B(X) at t=f:            {B_X_arr[-1]:.4f}  (X={X_arr[-1]:.3f})")                    # [ADD M4]
+print(f"  Lz/|L| min:             {float(np.nanmin(Lz_over_L)):.4f}  (1.000 = no precession)")# [ADD M5]
 print("=" * 65)
 
 # ============================================================
@@ -1045,6 +1116,9 @@ np.savez(
     ln_lam_R_arr=ln_lam_R_arr,
     a_meas=a_meas,
     a_chandra_Rdep=a_chandra_Rdep,
+    Lz_over_L=Lz_over_L,                                 # [ADD M5]
+    X_arr=X_arr,                                          # [ADD M4]
+    B_X_arr=B_X_arr,                                      # [ADD M4]
     # background time series
     K_bg=K_bg_arr,
     W_bg=W_bg_arr,

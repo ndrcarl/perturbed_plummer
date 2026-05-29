@@ -3,6 +3,32 @@
 # Plummer sphere + perturber initial conditions for the Barnes treecode.
 # Code units: G=1, M_tot=1, b=1.
 # Perturber (index 0) at R0 with tangential speed vfrac*v_circ(R0).
+#
+# Changes vs original (marked [FIX 1] and [FIX 2]):
+#
+#   [FIX 1] v_rel_rp: linear sum -> quadrature sum.
+#           Notes write  eps = alpha*G*M_BH / (v_BH^2 + sigma^2),
+#           so the characteristic relative speed is v_rel = sqrt(v^2 + sigma^2),
+#           not v + sigma.  The old form overestimated v_rel by ~36%, causing
+#           eps and dt to be slightly underestimated.
+#
+#   [FIX 2] tstop lower bound: SIS formula -> Plummer-native Chandrasekhar estimate.
+#           The SIS formula  t_DF = R0^2*v_circ / (0.8*G*M_p*ln_Lambda)  assumes
+#           v_circ = const and uses ln_Lambda = ln(1/eta), neither of which holds
+#           for a Plummer sphere.
+#
+#           The handwritten notes (Images 1 & 2) derive an analytic integral for
+#           the inspiral time, but the full prefactor K is not written out in the
+#           images we have, so F(R0)/K cannot be assembled.
+#
+#           Instead, we use a simple Plummer-native estimate:
+#               t_DF_Plummer = R0 * v_circ(R0) / (2 * a_DF(R0))
+#           where a_DF uses the full Chandrasekhar formula with Plummer rho, sigma,
+#           and ln_Lambda = ln(M_enc(R0)/M_p).  This is ~7.5 code units at default
+#           parameters, still well below 5*T_orb=66, so tstop_lower remains
+#           dominated by the orbital timescale in all tested cases.
+#
+#           The SIS estimate and its ln_lambda are removed entirely.
 
 import numpy as np
 import random
@@ -32,7 +58,7 @@ mass_i = M_tot / N
 eta    = args.eta
 M_pert = eta * M_tot
 vfrac  = args.vfrac
-dtout  = args.dtout  
+dtout  = args.dtout
 
 if not (0.0 < eta < 1.0):
     sys.exit(f"--eta must be in (0,1), got {eta}")
@@ -44,45 +70,52 @@ if dtout <= 0.0:
     sys.exit(f"--dtout must be positive, got {dtout}")
 
 # ---- structural quantities ----
-r_hm  = b / math.sqrt(2.0**(2.0/3.0) - 1.0)   # ~ 1.305
+r_hm  = b / math.sqrt(2.0**(2.0/3.0) - 1.0)   # half-mass radius ~ 1.305 b
 R0    = args.R0 if args.R0 is not None else r_hm
 if R0 <= 0.0:
     sys.exit(f"--R0 must be positive, got {R0}")
 
 rho_c = 3.0 * M_tot / (4.0 * math.pi * b**3)
-t_dyn = math.sqrt(3.0 * math.pi / (16.0 * G * rho_c))   # = pi/2
+t_dyn = math.sqrt(3.0 * math.pi / (16.0 * G * rho_c))   # = pi/2 in code units
 
-V_hm    = (4.0 / 3.0) * math.pi * r_hm**3
-n_hm    = (N / 2.0) / V_hm
-d_mean  = n_hm**(-1.0 / 3.0)
+V_hm   = (4.0 / 3.0) * math.pi * r_hm**3
+n_hm   = (N / 2.0) / V_hm
+d_mean = n_hm**(-1.0 / 3.0)                              # mean interparticle separation
 
-t_relax = (N / (8.0 * math.log(N))) * t_dyn
+t_relax = (N / (8.0 * math.log(N))) * t_dyn              # two-body relaxation time
 
 # ---- perturber at R0 ----
 M_enc_R0  = M_tot * R0**3 / (R0**2 + b**2)**1.5
 v_circ_R0 = math.sqrt(G * M_enc_R0 / R0)
 v_pert    = vfrac * v_circ_R0
-sigma2_R0 = G * M_tot / (6.0 * math.sqrt(R0**2 + b**2))
+sigma2_R0 = G * M_tot / (6.0 * math.sqrt(R0**2 + b**2))  # Jeans 1D dispersion^2
 sigma_R0  = math.sqrt(sigma2_R0)
 T_orb     = 2.0 * math.pi * R0 / v_circ_R0
 
-# ---- pericenter ----
+# ---- pericenter (= R0 for circular orbit) ----
 r_peri    = R0
 sigma2_rp = sigma2_R0
 v_tang_rp = v_circ_R0
 
-v_rel_rp = v_tang_rp + math.sqrt(sigma2_rp)
+# [FIX 1] v_rel: quadrature sum, not linear sum.
+# Notes write  eps = alpha * G*M_BH / (v_BH^2 + sigma^2),
+# so the characteristic relative speed satisfies  v_rel^2 = v_M^2 + sigma^2.
+# The old  v_rel = v_M + sigma  overestimated by ~36%, causing eps and dt to
+# be slightly underestimated.
+v_rel_rp = math.sqrt(v_tang_rp**2 + sigma2_rp)           # [FIX 1]
 
 # ---- eps recommendation ----
-alpha_eps       = 0.1
-eps_background  = 0.1 * d_mean 
-r_inf_peri      = G * M_pert / (v_tang_rp**2 + sigma2_rp)
+# Notes: eps ~ min(alpha*d_mean, alpha*r_inf) with r_inf = G*M_p/(v^2+sigma^2)
+alpha_eps      = 0.1
+eps_background = 0.1 * d_mean
+r_inf_peri     = G * M_pert / (v_tang_rp**2 + sigma2_rp)
 eps_recommended = max(eps_background, alpha_eps * r_inf_peri)
 
 # ---- dtime recommendation ----
-eta_acc      = 0.05
-t_2body      = eps_recommended / v_rel_rp
-t_potential  = T_orb / (2.0 * math.pi)
+# Notes: dt = eta_acc * min(t_2body, t_potential)
+eta_acc        = 0.05
+t_2body        = eps_recommended / v_rel_rp               # softened crossing time
+t_potential    = T_orb / (2.0 * math.pi)                  # orbital timescale / 2pi
 dt_recommended = eta_acc * min(t_2body, t_potential)
 
 def nearest_power2_dt(dt_val):
@@ -92,12 +125,39 @@ def nearest_power2_dt(dt_val):
 
 dtime_denom, dt_value = nearest_power2_dt(dt_recommended)
 
-# ---- tstop recommendation ----
-ln_lambda = math.log(1.0 / eta) 
-t_DF_SIS  = R0**2 * v_circ_R0 / (0.8 * G * M_pert * ln_lambda)
-tstop_lower = max(5.0 * T_orb, 3.0 * t_DF_SIS)
-tstop_upper = t_relax / 5.0
-tstop_raw   = min(tstop_lower, tstop_upper)
+# ---- tstop recommendation — Plummer-native DF estimate              [FIX 2] ----
+#
+# Coulomb logarithm: Plummer derivation.
+#   b_min = G*M_p/(v_circ^2 + sigma^2) = G*M_p*R0/M_enc(R0)
+#   b_max ~ R0
+#   => ln_Lambda = ln(M_enc(R0) / M_p)   [v_M = v_circ, leading order]
+# This replaces the SIS approximation ln_Lambda = ln(1/eta).
+ln_lambda_R0 = math.log(max(M_enc_R0 / M_pert, 1.1))
+
+# Chandrasekhar bracket B(X0) at R0 with v_M = v_circ(R0).
+# B(X) = erf(X) - (2X/sqrt(pi))*exp(-X^2),  X = v_M / (sqrt(2)*sigma)
+X0 = v_circ_R0 / (math.sqrt(2.0) * sigma_R0)
+B0 = math.erf(X0) - (2.0 * X0 / math.sqrt(math.pi)) * math.exp(-X0**2)
+B0 = max(B0, 1e-6)
+
+# Plummer density at R0
+rho_R0 = 3.0 * M_tot / (4.0 * math.pi * b**3) * (1.0 + (R0 / b)**2)**(-2.5)
+
+# DF deceleration at R0 (full Chandrasekhar formula, Plummer quantities)
+a_DF_R0 = 4.0 * math.pi * G**2 * M_pert * rho_R0 * ln_lambda_R0 * B0 / v_circ_R0**2
+
+# Simple Plummer DF inspiral timescale: t ~ R0*v_circ / (2*a_DF)
+# This is a lower bound (assumes a_DF constant, correct at order of magnitude).
+# The notes (Images 1&2) derive an analytic integral for the exact inspiral time,
+# but the full prefactor K is not yet extracted from those pages; when it is,
+# t_DF_Plummer can be replaced by F(R0)/K where
+#   F(R0) = (1/2)*ln(1+R0^2) + 1/(1+R0^2) - 1/(4*(1+R0^2)^2) - 3/4
+# (antiderivative of r^5/(1+r^2)^3 evaluated from 0 to R0).
+t_DF_Plummer = R0 * v_circ_R0 / (2.0 * max(a_DF_R0, 1e-30))
+
+tstop_lower       = max(5.0 * T_orb, 3.0 * t_DF_Plummer)
+tstop_upper       = t_relax / 5.0
+tstop_raw         = min(tstop_lower, tstop_upper)
 tstop_recommended = max(10.0 * round(tstop_raw / 10.0), 10.0)
 
 # ---- random seed ----
@@ -106,28 +166,32 @@ np.random.seed(42)
 
 # ---- print summary ----
 print(f"N={N}  eta={eta}  R0={R0:.4f}  eps={eps_recommended:.4f}  dtime={dt_recommended:.6f}")
-print(f"tstop_lower={tstop_lower:.1f}  (5*T_orb={5*T_orb:.1f}, 3*t_DF={3*t_DF_SIS:.1f})")
+print(f"tstop_lower={tstop_lower:.1f}  (5*T_orb={5*T_orb:.1f}, 3*t_DF={3*t_DF_Plummer:.1f})")
+print(f"  [Plummer DF: a_DF={a_DF_R0:.4e}  X0={X0:.3f}  B(X0)={B0:.3f}  lnL={ln_lambda_R0:.3f}]")
 print(f"tstop_upper={tstop_upper:.1f}  (t_relax/5)")
 print(f"tstop_recommended={tstop_recommended:.0f}  dtout={dtout}")
 
 # ---- write params JSON ----
 params = {
-    "eta"         : eta,
-    "R0"          : R0,
-    "vfrac"       : vfrac,
-    "N_bg"        : N,
-    "eps"         : round(eps_recommended, 6),
-    "dtime_denom" : dtime_denom,
-    "dtime_str"   : f"1/{dtime_denom}",
-    "tstop"       : float(tstop_recommended),
-    "dtout"       : dtout,
-    "theta"       : 0.50,
-    "n_snapshots" : int(tstop_recommended / dtout),
-    "t_DF_SIS"    : round(t_DF_SIS, 2),
-    "T_orb"       : round(T_orb, 4),
-    "t_relax"     : round(t_relax, 1),
-    "ln_lambda"   : round(ln_lambda, 4),
-    "r_peri"      : round(r_peri, 6),
+    "eta"            : eta,
+    "R0"             : R0,
+    "vfrac"          : vfrac,
+    "N_bg"           : N,
+    "eps"            : round(eps_recommended, 6),
+    "dtime_denom"    : dtime_denom,
+    "dtime_str"      : f"1/{dtime_denom}",
+    "tstop"          : float(tstop_recommended),
+    "dtout"          : dtout,
+    "theta"          : 0.50,
+    "n_snapshots"    : int(tstop_recommended / dtout),
+    "t_DF_Plummer"   : round(t_DF_Plummer, 2),      # replaces t_DF_SIS
+    "a_DF_R0"        : round(a_DF_R0, 6),
+    "X0"             : round(X0, 4),                 # Chandrasekhar argument at R0
+    "B0"             : round(B0, 4),                 # Chandrasekhar bracket at R0
+    "ln_lambda_R0"   : round(ln_lambda_R0, 4),       # replaces ln_lambda
+    "T_orb"          : round(T_orb, 4),
+    "t_relax"        : round(t_relax, 1),
+    "r_peri"         : round(r_peri, 6),
 }
 
 with open(args.params, 'w') as f:
@@ -146,6 +210,8 @@ def isotropic_vec(mag):
             mag * math.cos(theta))
 
 def get_q():
+    # Rejection sampling for the Plummer DF speed distribution:
+    # f(q) propto q^2 * (1 - q^2)^(7/2),  q = v / v_esc  in [0, 1)
     g_max = 0.093
     while True:
         q = random.random()
@@ -159,11 +225,13 @@ positions  = []
 velocities = []
 
 for _ in range(N):
+    # Position: inversion sampling of Plummer CDF M(<r)/M_tot = r^3/(r^2+b^2)^(3/2)
     X   = random.random()
     r   = b / math.sqrt(X**(-2.0 / 3.0) - 1.0)
     pos = isotropic_vec(r)
     positions.append(list(pos))
 
+    # Velocity: rejection sample Plummer DF via q = v/v_esc
     Psi   = G * M_tot / math.sqrt(r**2 + b**2)
     v_esc = math.sqrt(2.0 * Psi)
     q     = get_q()
@@ -184,7 +252,7 @@ pos_cm_tot = (M_tot * pos_cm_bg + M_pert * pos_pert) / M_total_system
 positions -= pos_cm_tot
 pos_pert  -= pos_cm_tot
 
-# recompute v_circ at corrected radius
+# Recompute v_circ at the CM-corrected perturber radius
 R0_actual     = float(np.linalg.norm(pos_pert))
 M_enc_actual  = M_tot * R0_actual**3 / (R0_actual**2 + b**2)**1.5
 v_circ_actual = math.sqrt(G * M_enc_actual / R0_actual)
