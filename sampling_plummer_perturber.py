@@ -110,7 +110,9 @@ v_rel_rp = math.sqrt(v_tang_rp**2 + sigma2_rp)  # [FIX 1]
 alpha_eps = 0.1
 eps_background = 0.1 * d_mean
 r_inf_peri = G * M_pert / (v_tang_rp**2 + sigma2_rp)
-eps_recommended = max(eps_background, alpha_eps * r_inf_peri)
+eps_perturber = alpha_eps * r_inf_peri
+eps_recommended = max(eps_background, eps_perturber)
+eps_winner = "background" if eps_background > eps_perturber else "perturber"
 
 # ---- dtime recommendation ----
 # Notes: dt = eta_acc * min(t_2body, t_potential)
@@ -118,6 +120,7 @@ eta_acc = 0.05
 t_2body = eps_recommended / v_rel_rp  # softened crossing time
 t_potential = T_orb / (2.0 * math.pi)  # orbital timescale / 2pi
 dt_recommended = eta_acc * min(t_2body, t_potential)
+dt_winner = "2-body" if t_2body < t_potential else "potential"
 
 
 def nearest_power2_dt(dt_val):
@@ -161,6 +164,11 @@ t_DF_Plummer = R0 * v_circ_R0 / (2.0 * max(a_DF_R0, 1e-30))
 tstop_lower = max(5.0 * T_orb, 3.0 * t_DF_Plummer)
 tstop_upper = t_relax / 5.0
 tstop_raw = min(tstop_lower, tstop_upper)
+tstop_winner = (
+    "lower bound (orbit/DF)"
+    if tstop_lower < tstop_upper
+    else "upper bound (relaxation)"
+)
 tstop_recommended = max(10.0 * round(tstop_raw / 10.0), 10.0)
 
 # ---- random seed ----
@@ -168,17 +176,22 @@ random.seed(42)
 np.random.seed(42)
 
 # ---- print summary ----
+print(f"N={N}  eta={eta}  R0={R0:.4f}")
 print(
-    f"N={N}  eta={eta}  R0={R0:.4f}  eps={eps_recommended:.4f}  dtime={dt_recommended:.6f}"
+    f"eps={eps_recommended:.4f}  [won by {eps_winner} | bg={eps_background:.4f}, pert={eps_perturber:.4f}]"
 )
 print(
-    f"tstop_lower={tstop_lower:.1f}  (5*T_orb={5 * T_orb:.1f}, 3*t_DF={3 * t_DF_Plummer:.1f})"
+    f"dtime={dt_recommended:.6f}  [won by {dt_winner} | 2body={eta_acc * t_2body:.6f}, pot={eta_acc * t_potential:.6f}]"
 )
+print(f"tstop_recommended={tstop_recommended:.0f}  [won by {tstop_winner}]")
+print(
+    f"  -> tstop_lower={tstop_lower:.1f}  (5*T_orb={5 * T_orb:.1f}, 3*t_DF={3 * t_DF_Plummer:.1f})"
+)
+print(f"  -> tstop_upper={tstop_upper:.1f}  (t_relax/5)")
 print(
     f"  [Plummer DF: a_DF={a_DF_R0:.4e}  X0={X0:.3f}  B(X0)={B0:.3f}  lnL={ln_lambda_R0:.3f}]"
 )
-print(f"tstop_upper={tstop_upper:.1f}  (t_relax/5)")
-print(f"tstop_recommended={tstop_recommended:.0f}  dtout={dtout}")
+print(f"dtout={dtout}")
 
 # ---- write params JSON ----
 params = {
