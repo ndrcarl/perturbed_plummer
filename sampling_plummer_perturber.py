@@ -45,7 +45,7 @@ parser.add_argument('--N',      type=int,   default=10000)
 parser.add_argument('--seed',   type=int,   default=None)
 parser.add_argument('--out',    type=str,   default='plummer_perturber.txt')
 parser.add_argument('--params', type=str,   default='params_recommended.json')
-parser.add_argument('--dtout',  type=float, default=1/16,
+parser.add_argument('--dtout',  type=float, default=1/4,
                     help='output time interval (code units)')
 args = parser.parse_args()
 

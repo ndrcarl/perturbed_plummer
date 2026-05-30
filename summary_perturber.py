@@ -304,7 +304,7 @@ R_M_arr = []
 v_M_arr = []
 Lz_M_arr = []
 L_M_arr = []
-Lz_over_L_arr = []                                        # [ADD M5]
+Lz_over_L_arr = []  # [ADD M5]
 E_orb_M_arr = []
 x_M_traj = []
 y_M_traj = []
@@ -415,7 +415,7 @@ R_M = np.array(R_M_arr)
 v_M = np.array(v_M_arr)
 Lz_M = np.array(Lz_M_arr)
 L_M = np.array(L_M_arr)
-Lz_over_L = np.array(Lz_over_L_arr)                      # [ADD M5]
+Lz_over_L = np.array(Lz_over_L_arr)  # [ADD M5]
 E_orb_M = np.array(E_orb_M_arr)
 x_M_traj = np.array(x_M_traj)
 y_M_traj = np.array(y_M_traj)
@@ -445,6 +445,7 @@ slope_L, *_ = stats.linregress(times, L_M)
 # R-dependent Coulomb log along the actual trajectory
 ln_lam_R_arr = np.array([ln_lam_at_R(R_M[i], v_M[i]) for i in range(n_snaps)])
 
+
 # [ADD M4] Chandrasekhar bracket B(X) and argument X along the trajectory.
 # X = v_M / (sqrt(2)*sigma(R)),  B(X) = erf(X) - (2X/sqrt(pi))*exp(-X^2).
 # For the SIS, v_circ = sqrt(2)*sigma so X=1 and B≈0.4 everywhere.
@@ -454,14 +455,15 @@ def _compute_B_X():
     X_arr = np.empty(n_snaps)
     B_arr = np.empty(n_snaps)
     for i in range(n_snaps):
-        sig2 = G * M_tot / (6.0 * math.sqrt(R_M[i]**2 + b**2))
+        sig2 = G * M_tot / (6.0 * math.sqrt(R_M[i] ** 2 + b**2))
         sigma = math.sqrt(sig2)
         X = v_M[i] / (math.sqrt(2.0) * sigma) if sigma > 0 else 0.0
         X_arr[i] = X
         B_arr[i] = chandrasekhar_bracket(X) if X > 0 else 0.0
     return X_arr, B_arr
 
-X_arr, B_X_arr = _compute_B_X()                           # [ADD M4]
+
+X_arr, B_X_arr = _compute_B_X()  # [ADD M4]
 
 # Measured deceleration: -dL/dt / R
 # Smooth L first to remove N-body noise, then differentiate.
@@ -888,9 +890,10 @@ ax.legend(fontsize=7)
 # the Plummer DF departs from the SIS approximation along the inspiral.
 ax = axes[2, 0]
 ax.plot(times, B_X_arr, color="k", lw=0.8, label="B(X(t))")
-ax.plot(times, X_arr,   color="0.5", lw=0.6, ls="--", alpha=0.8, label="X(t)  [right scale]")
-ax.axhline(0.4, color="b", ls=":", lw=1.0,
-           label="B=0.4  (SIS reference,  X=1)")
+ax.plot(
+    times, X_arr, color="0.5", lw=0.6, ls="--", alpha=0.8, label="X(t)  [right scale]"
+)
+ax.axhline(0.4, color="b", ls=":", lw=1.0, label="B=0.4  (SIS reference,  X=1)")
 ax.axhline(1.0, color="0.7", ls=":", lw=0.8)
 ax.set_xlabel("t")
 ax.set_ylabel("B(X) / X")
@@ -1077,9 +1080,13 @@ print(f"  ln_Lambda_eff (median): {lnlam_eff_med:.3f}")
 print(f"  ln_Lambda(R_M(0)):      {ln_lam_at_R(R_M[0]):.3f}  [= ln(M(<R0)/M_p)]")
 print(f"  ln_Lambda(R_M(f)):      {ln_lam_at_R(R_M[-1]):.3f}  [at final radius]")
 print(f"  DK_bg / K_bg(0):        {DK_bg[-1] / K_bg_arr[0]:.4f}")
-print(f"  B(X) at t=0:            {B_X_arr[0]:.4f}  (SIS ref = 0.400,  X={X_arr[0]:.3f})")   # [ADD M4]
-print(f"  B(X) at t=f:            {B_X_arr[-1]:.4f}  (X={X_arr[-1]:.3f})")                    # [ADD M4]
-print(f"  Lz/|L| min:             {float(np.nanmin(Lz_over_L)):.4f}  (1.000 = no precession)")# [ADD M5]
+print(
+    f"  B(X) at t=0:            {B_X_arr[0]:.4f}  (SIS ref = 0.400,  X={X_arr[0]:.3f})"
+)  # [ADD M4]
+print(f"  B(X) at t=f:            {B_X_arr[-1]:.4f}  (X={X_arr[-1]:.3f})")  # [ADD M4]
+print(
+    f"  Lz/|L| min:             {float(np.nanmin(Lz_over_L)):.4f}  (1.000 = no precession)"
+)  # [ADD M5]
 print("=" * 65)
 
 # ============================================================
@@ -1116,9 +1123,9 @@ np.savez(
     ln_lam_R_arr=ln_lam_R_arr,
     a_meas=a_meas,
     a_chandra_Rdep=a_chandra_Rdep,
-    Lz_over_L=Lz_over_L,                                 # [ADD M5]
-    X_arr=X_arr,                                          # [ADD M4]
-    B_X_arr=B_X_arr,                                      # [ADD M4]
+    Lz_over_L=Lz_over_L,  # [ADD M5]
+    X_arr=X_arr,  # [ADD M4]
+    B_X_arr=B_X_arr,  # [ADD M4]
     # background time series
     K_bg=K_bg_arr,
     W_bg=W_bg_arr,

@@ -15,6 +15,7 @@ ETA=0.05
 R0=1.305
 VFRAC=1.0
 N_BG=10000
+DTOUT=0.25
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -32,6 +33,10 @@ while [[ $# -gt 0 ]]; do
     ;;
   --N)
     N_BG="$2"
+    shift 2
+    ;;
+  --dtout)
+    DTOUT="$2"
     shift 2
     ;;
   *)
@@ -60,7 +65,7 @@ echo "step 1: sampling_plummer_perturber.py" | tee -a "$LOG_FILE"
 cd "$RUN_DIR" || exit 1
 
 python3 "$BASE_DIR/sampling_plummer_perturber.py" \
-  --eta "$ETA" --R0 "$R0" --vfrac "$VFRAC" --N "$N_BG" \
+  --eta "$ETA" --R0 "$R0" --vfrac "$VFRAC" --N "$N_BG" --dtout "$DTOUT" \
   --out plummer_perturber.txt --params params_recommended.json \
   >>"$LOG_FILE" 2>&1
 
