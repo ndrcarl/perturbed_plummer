@@ -123,14 +123,20 @@ def sigma_theory_jeans(r_arr):
 #   I_v(r, v_M) = rho(r) * B_Plummer(r, v_M)
 # where:
 #   B_Plummer = integral_0^{q_M} q^2*(1-q^2)^(7/2) dq / I_q_full
-#   q_M = v_M / v_esc(r),   I_q_full = integral_0^1 q^2*(1-q^2)^(7/2) dq
+#   q_M = v_M / v_esc(r),   I_q_full = integral_0^1 q^2*(1-q^2)^(7/2) dq = 7*pi/512
 #
-# Evaluated using Monte Carlo integration.
+# Precomputed deterministically using the cumulative trapezoid rule on a fine
+# q grid.  This replaces the original Monte Carlo approach which was slow
+# (~20M random draws in the Euler loop) and introduced stochastic noise.
+# Exact analytic value: I_q_full = 7*pi/512 ~ 0.042938.
 
-# Pre-compute normalization using 1 million MC samples for stability
-np.random.seed(42)  # Ensure reproducible MC integration in the analysis script
-_q_full_samples = np.random.uniform(0.0, 1.0, 1000000)
-_I_q_full = np.mean(_q_full_samples**2 * (1.0 - _q_full_samples**2) ** 3.5)
+_q_cdf_grid = np.linspace(0.0, 1.0, 10000)
+_f_cdf_grid = _q_cdf_grid**2 * (1.0 - _q_cdf_grid**2) ** 3.5
+_dq_cdf     = _q_cdf_grid[1] - _q_cdf_grid[0]
+_I_cum_cdf  = np.zeros(10000)
+_I_cum_cdf[1:] = np.cumsum(0.5 * (_f_cdf_grid[:-1] + _f_cdf_grid[1:]) * _dq_cdf)
+_I_q_full   = _I_cum_cdf[-1]   # numerically: 7*pi/512 ~ 0.042938
+_B_cdf      = _I_cum_cdf / _I_q_full   # CDF table: B_Plummer(q_M)
 
 
 def plummer_vesc(r):
@@ -142,6 +148,7 @@ def B_Plummer(r, v_M=None):
     """
     Exact Plummer DF bracket: fraction of background particles slower than v_M.
     If v_M is None uses v_circ(r) (circular orbit).  Returns value in [0, 1].
+    Uses precomputed CDF table — deterministic and fast.
     """
     if v_M is None:
         v_M = plummer_vcirc(r)
@@ -149,12 +156,7 @@ def B_Plummer(r, v_M=None):
     if v_e < 1e-12 or v_M <= 0.0:
         return 0.0
     q_M = min(v_M / v_e, 1.0 - 1e-10)
-
-    # Monte Carlo integration for the partial integral
-    q_samples = np.random.uniform(0.0, q_M, 5000)
-    I_partial = q_M * np.mean(q_samples**2 * (1.0 - q_samples**2) ** 3.5)
-
-    return I_partial / _I_q_full
+    return float(np.interp(q_M, _q_cdf_grid, _B_cdf))
 
 
 def lag_radius_theory(frac):

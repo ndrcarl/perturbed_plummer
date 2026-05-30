@@ -12,23 +12,17 @@
 #           not v + sigma.  The old form overestimated v_rel by ~36%, causing
 #           eps and dt to be slightly underestimated.
 #
-#   [FIX 2] tstop lower bound: SIS formula -> Plummer-native Chandrasekhar estimate.
+#   [FIX 2] tstop lower bound: SIS formula -> full Plummer T_DF integral.
 #           The SIS formula  t_DF = R0^2*v_circ / (0.8*G*M_p*ln_Lambda)  assumes
 #           v_circ = const and uses ln_Lambda = ln(1/eta), neither of which holds
 #           for a Plummer sphere.
 #
-#           The handwritten notes (Images 1 & 2) derive an analytic integral for
-#           the inspiral time, but the full prefactor K is not written out in the
-#           images we have, so F(R0)/K cannot be assembled.
-#
-#           Instead, we use a simple Plummer-native estimate:
-#               t_DF_Plummer = R0 * v_circ(R0) / (2 * a_DF(R0))
-#           where a_DF uses the full Chandrasekhar formula with Plummer rho, sigma,
-#           and ln_Lambda = ln(M_enc(R0)/M_p).  This is ~7.5 code units at default
-#           parameters, still well below 5*T_orb=66, so tstop_lower remains
-#           dominated by the orbital timescale in all tested cases.
-#
-#           The SIS estimate and its ln_lambda are removed entirely.
+#           Now uses the full derivation (document Section 7):
+#               T_DF = (1 / (6*(M_p+m)*ln_Lambda)) *
+#                      integral_{eps}^{R0}  R^2*(4+R^2) / (B_Plummer(R)*(1+R^2)^(3/4)) dR
+#           with the exact Plummer bracket B_Plummer from Eddington inversion.
+#           Lower limit = eps (softening) to avoid the core-stalling divergence.
+#           Evaluated via cumulative trapezoid on a fine R grid (no scipy needed).
 
 import numpy as np
 import random
@@ -131,6 +125,29 @@ def nearest_power2_dt(dt_val):
 
 dtime_denom, dt_value = nearest_power2_dt(dt_recommended)
 
+# ---- Plummer DF bracket — precomputed CDF for T_DF integral          [FIX 2] ----
+# B_Plummer(q_M) = int_0^{q_M} q^2*(1-q^2)^(7/2) dq / I_q_full
+# q_M = v_circ(R) / v_esc(R) = R / sqrt(2*(1+R^2))
+# I_q_full = 7*pi/512 ~ 0.042938  (exact Beta function result)
+# Precomputed with cumulative trapezoid: deterministic, no scipy needed.
+_q_cdf  = np.linspace(0.0, 1.0, 10000)
+_f_cdf  = _q_cdf**2 * (1.0 - _q_cdf**2) ** 3.5
+_dq_cdf = _q_cdf[1] - _q_cdf[0]
+_I_c    = np.zeros(10000)
+_I_c[1:] = np.cumsum(0.5 * (_f_cdf[:-1] + _f_cdf[1:]) * _dq_cdf)
+_I_q_full_s = _I_c[-1]          # ~ 0.042938
+_B_cdf_s    = _I_c / _I_q_full_s
+
+
+def B_Plummer_fast(R_val):
+    """Exact Plummer bracket at v_M = v_circ(R_val), via CDF interpolation."""
+    v_c2 = G * M_tot * R_val**2 / (R_val**2 + b**2) ** 1.5
+    v_e2 = 2.0 * G * M_tot / math.sqrt(R_val**2 + b**2)
+    if v_e2 < 1e-30:
+        return 0.0
+    q_M = min(math.sqrt(max(v_c2, 0.0) / v_e2), 0.9999)
+    return float(np.interp(q_M, _q_cdf, _B_cdf_s))
+
 # ---- tstop recommendation — Plummer-native DF estimate              [FIX 2] ----
 #
 # Coulomb logarithm: Plummer derivation.
@@ -140,26 +157,26 @@ dtime_denom, dt_value = nearest_power2_dt(dt_recommended)
 # This replaces the SIS approximation ln_Lambda = ln(1/eta).
 ln_lambda_R0 = math.log(max(M_enc_R0 / M_pert, 1.1))
 
-# Chandrasekhar bracket B(X0) at R0 with v_M = v_circ(R0).
-# B(X) = erf(X) - (2X/sqrt(pi))*exp(-X^2),  X = v_M / (sqrt(2)*sigma)
-X0 = v_circ_R0 / (math.sqrt(2.0) * sigma_R0)
-B0 = math.erf(X0) - (2.0 * X0 / math.sqrt(math.pi)) * math.exp(-(X0**2))
-B0 = max(B0, 1e-6)
+# DF deceleration at R0 using exact Plummer bracket and simplified form  [FIX 2]
+# a_DF = 3*(M_p+m)*ln_Lambda*B_Plummer / (R^2*(1+R^2))  (document Section 3)
+B0    = B_Plummer_fast(R0)
+B0    = max(B0, 1e-6)
+a_DF_R0 = 3.0 * (M_pert + mass_i) * ln_lambda_R0 * B0 / (R0**2 * (1.0 + R0**2))
 
-# Plummer density at R0
-rho_R0 = 3.0 * M_tot / (4.0 * math.pi * b**3) * (1.0 + (R0 / b) ** 2) ** (-2.5)
-
-# DF deceleration at R0 (full Chandrasekhar formula, Plummer quantities)
-a_DF_R0 = 4.0 * math.pi * G**2 * M_pert * rho_R0 * ln_lambda_R0 * B0 / v_circ_R0**2
-
-# Simple Plummer DF inspiral timescale: t ~ R0*v_circ / (2*a_DF)
-# This is a lower bound (assumes a_DF constant, correct at order of magnitude).
-# The notes (Images 1&2) derive an analytic integral for the exact inspiral time,
-# but the full prefactor K is not yet extracted from those pages; when it is,
-# t_DF_Plummer can be replaced by F(R0)/K where
-#   F(R0) = (1/2)*ln(1+R0^2) + 1/(1+R0^2) - 1/(4*(1+R0^2)^2) - 3/4
-# (antiderivative of r^5/(1+r^2)^3 evaluated from 0 to R0).
-t_DF_Plummer = R0 * v_circ_R0 / (2.0 * max(a_DF_R0, 1e-30))
+# Full T_DF integral: document Section 7 with exact Plummer bracket     [FIX 2]
+# T_DF = (1/(6*(M_p+m)*lnL)) * int_{R_low}^{R0} R^2*(4+R^2)/(B_Plum*(1+R^2)^(3/4)) dR
+# Lower limit = eps (softening floor) to avoid the core-stalling 1/R divergence.
+R_low   = max(eps_recommended, 0.05)
+R_int   = np.linspace(R_low, R0, 600)
+B_int   = np.array([B_Plummer_fast(R) for R in R_int])
+with np.errstate(divide="ignore", invalid="ignore"):
+    integrand = np.where(
+        B_int > 1e-10,
+        R_int**2 * (4.0 + R_int**2) / (B_int * (1.0 + R_int**2) ** 0.75),
+        0.0,
+    )
+integral_val  = float(np.trapezoid(integrand, R_int))
+t_DF_Plummer  = integral_val / (6.0 * (M_pert + mass_i) * ln_lambda_R0)
 
 tstop_lower = max(5.0 * T_orb, 3.0 * t_DF_Plummer)
 tstop_upper = t_relax / 5.0
@@ -189,7 +206,7 @@ print(
 )
 print(f"  -> tstop_upper={tstop_upper:.1f}  (t_relax/5)")
 print(
-    f"  [Plummer DF: a_DF={a_DF_R0:.4e}  X0={X0:.3f}  B(X0)={B0:.3f}  lnL={ln_lambda_R0:.3f}]"
+    f"  [Plummer DF: a_DF={a_DF_R0:.4e}  B_Plum(R0)={B0:.3f}  lnL={ln_lambda_R0:.3f}  t_DF(full)={t_DF_Plummer:.1f}]"
 )
 print(f"dtout={dtout}")
 
@@ -206,11 +223,10 @@ params = {
     "dtout": dtout,
     "theta": 0.50,
     "n_snapshots": int(tstop_recommended / dtout),
-    "t_DF_Plummer": round(t_DF_Plummer, 2),  # replaces t_DF_SIS
+    "t_DF_Plummer": round(t_DF_Plummer, 2),  # full integral, Section 7
     "a_DF_R0": round(a_DF_R0, 6),
-    "X0": round(X0, 4),  # Chandrasekhar argument at R0
-    "B0": round(B0, 4),  # Chandrasekhar bracket at R0
-    "ln_lambda_R0": round(ln_lambda_R0, 4),  # replaces ln_lambda
+    "B0_Plummer": round(B0, 4),              # exact Plummer bracket at R0
+    "ln_lambda_R0": round(ln_lambda_R0, 4),
     "T_orb": round(T_orb, 4),
     "t_relax": round(t_relax, 1),
     "r_peri": round(r_peri, 6),
