@@ -380,6 +380,8 @@ Lz_M_arr = []
 L_M_arr = []
 Lz_over_L_arr = []  # [ADD M5]
 E_orb_M_arr = []
+v_r_arr = []        # radial velocity in live CM frame
+v_t_arr = []        # tangential velocity in live CM frame
 x_M_traj = []
 y_M_traj = []
 K_bg_arr = []
@@ -420,6 +422,9 @@ for t, pos, vel, phi in iter_snapshots(outfile, N_total):
     dv_p = vel_p - vcm_bg
     R_p = float(np.linalg.norm(dr_p))
     v_p_s = float(np.linalg.norm(dv_p))
+    # Velocity decomposition: radial and tangential (same as test.py)
+    v_r_p = float(np.dot(dv_p, dr_p) / R_p) if R_p > 1e-12 else 0.0
+    v_t_p = float(np.sqrt(max(0.0, v_p_s**2 - v_r_p**2)))
     L_vec = np.cross(dr_p, dv_p)
     Lz_p = float(L_vec[2])
     L_p = float(np.linalg.norm(L_vec))
@@ -452,6 +457,8 @@ for t, pos, vel, phi in iter_snapshots(outfile, N_total):
     L_M_arr.append(L_p)
     Lz_over_L_arr.append(Lz_p / L_p if L_p > 1e-12 else np.nan)  # [ADD M5]
     E_orb_M_arr.append(E_orb_p)
+    v_r_arr.append(v_r_p)
+    v_t_arr.append(v_t_p)
     x_M_traj.append(float(pos_p[0]))
     y_M_traj.append(float(pos_p[1]))
     K_bg_arr.append(K_bg)
@@ -491,6 +498,8 @@ Lz_M = np.array(Lz_M_arr)
 L_M = np.array(L_M_arr)
 Lz_over_L = np.array(Lz_over_L_arr)  # [ADD M5]
 E_orb_M = np.array(E_orb_M_arr)
+v_r_M = np.array(v_r_arr)
+v_t_M = np.array(v_t_arr)
 x_M_traj = np.array(x_M_traj)
 y_M_traj = np.array(y_M_traj)
 K_bg_arr = np.array(K_bg_arr)
@@ -1210,6 +1219,66 @@ plt.close(fig)
 print(f"written: {os.path.basename(fname)}")
 
 # ============================================================
+#  P_KINEM: perturber kinematics
+#  (0,0) circularity eta = |L| / (R * v_circ(R))  — clipped to [0, 1.5]
+#  (0,1) v_t(t) and v_r(t) with v_circ(R) overlaid
+#  (1,0) reflex motion |R_cm_bg|(t)
+#  (1,1) kinematic phase space v_r vs v_t coloured by time
+# ============================================================
+
+# Circularity: |L| / J_circ,  J_circ = R * v_circ(R)
+# Clipped to [0, 1.5]: J_circ -> 0 as R -> 0 makes this diverge at late times
+# when the perturber is deep in the core.  Values > 1.5 are unphysical for a
+# quasi-circular orbit and arise purely from the J_circ -> 0 denominator.
+J_circ_arr = np.array([R_M[i] * plummer_vcirc(R_M[i]) for i in range(n_snaps)])
+with np.errstate(divide="ignore", invalid="ignore"):
+    circularity_raw = np.where(J_circ_arr > 1e-12, L_M / J_circ_arr, np.nan)
+circularity = np.clip(circularity_raw, 0.0, 2.0)   # clip before plotting
+
+fig, axes = plt.subplots(2, 2, figsize=(11, 8))
+
+ax = axes[0, 0]
+ax.plot(times, circularity, color="k", lw=0.8)
+ax.axhline(1.0, color="b", ls="--", lw=0.8, label=r"$\eta=1$ (circular)")
+ax.set_xlabel("t")
+ax.set_ylabel(r"$\eta = |L|\,/\,(R\,v_c(R))$  [clipped at 2]")
+ax.set_title("circularity  (1 = perfectly circular orbit)")
+ax.set_ylim(0, 1.6)
+ax.legend(fontsize=7)
+
+ax = axes[0, 1]
+vc_arr = np.array([plummer_vcirc(r) for r in R_M])
+ax.plot(times, v_t_M, color="k",   lw=0.8, label=r"$v_t$ (tangential)")
+ax.plot(times, v_r_M, color="0.5", lw=0.8, ls="--", label=r"$v_r$ (radial)")
+ax.plot(times, vc_arr, color="r",  lw=1.0, ls=":",  label=r"$v_c(R)$ theory")
+ax.set_xlabel("t")
+ax.set_ylabel("speed  (code units)")
+ax.set_title(r"velocity decomposition  $v_t$ and $v_r$")
+ax.legend(fontsize=7)
+
+ax = axes[1, 0]
+ax.plot(times, r_cm_bg_arr, color="m", lw=0.8)
+ax.set_xlabel("t")
+ax.set_ylabel(r"$|\mathbf{R}_\mathrm{cm}|$  (code units)")
+ax.set_title("reflex motion of host centre of mass")
+
+ax = axes[1, 1]
+sc = ax.scatter(v_r_M, v_t_M, c=times, s=3, cmap="viridis")
+ax.scatter(v_r_M[0],  v_t_M[0],  color="green", s=60, zorder=5, label="t=0")
+ax.scatter(v_r_M[-1], v_t_M[-1], color="red",   s=60, zorder=5, label="t=final")
+plt.colorbar(sc, ax=ax, label="time")
+ax.set_xlabel(r"$v_r$")
+ax.set_ylabel(r"$v_t$")
+ax.set_title("kinematic phase space")
+ax.legend(fontsize=7)
+
+plt.tight_layout()
+fname = os.path.join(run_dir, "plot_perturber_kinematics.pdf")
+fig.savefig(fname, bbox_inches="tight")
+plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# ============================================================
 #  SUMMARY PRINT
 # ============================================================
 
@@ -1318,6 +1387,9 @@ np.savez(
     sigma_vt=sigma_vt_arr,
     mean_vr=mean_vr_arr,
     r_cm_bg=r_cm_bg_arr,
+    v_r_M=v_r_M,
+    v_t_M=v_t_M,
+    circularity=circularity,
     dE_over_E0=dE_over_E0,
     DK_bg=DK_bg,
     # scalars

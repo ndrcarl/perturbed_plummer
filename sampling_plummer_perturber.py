@@ -12,17 +12,16 @@
 #           not v + sigma.  The old form overestimated v_rel by ~36%, causing
 #           eps and dt to be slightly underestimated.
 #
-#   [FIX 2] tstop lower bound: SIS formula -> full Plummer T_DF integral.
+#   [FIX 2] tstop lower bound: SIS formula -> Euler ODE for T_DF.
 #           The SIS formula  t_DF = R0^2*v_circ / (0.8*G*M_p*ln_Lambda)  assumes
 #           v_circ = const and uses ln_Lambda = ln(1/eta), neither of which holds
 #           for a Plummer sphere.
 #
-#           Now uses the full derivation (document Section 7):
-#               T_DF = (1 / (6*(M_p+m)*ln_Lambda)) *
-#                      integral_{eps}^{R0}  R^2*(4+R^2) / (B_Plummer(R)*(1+R^2)^(3/4)) dR
-#           with the exact Plummer bracket B_Plummer from Eddington inversion.
-#           Lower limit = eps (softening) to avoid the core-stalling divergence.
-#           Evaluated via cumulative trapezoid on a fine R grid (no scipy needed).
+#           Now uses the Euler ODE (document Section 6), same as summary_perturber.py:
+#               dR/dt = -6*(M_p+m)*lnL(R)*B_Plummer(R)/R^2 * (1+R^2)^(3/4)/(4+R^2)
+#           stepped forward with dt=0.01 until R < R_low = max(eps, 0.05).
+#           Both lnL(R) and B_Plummer(R) vary with R — fully consistent.
+#           B_Plummer is evaluated via the precomputed CDF (cumulative trapezoid).
 
 import numpy as np
 import random
@@ -148,35 +147,46 @@ def B_Plummer_fast(R_val):
     q_M = min(math.sqrt(max(v_c2, 0.0) / v_e2), 0.9999)
     return float(np.interp(q_M, _q_cdf, _B_cdf_s))
 
-# ---- tstop recommendation — Plummer-native DF estimate              [FIX 2] ----
+# ---- tstop recommendation — Euler ODE for T_DF                      [FIX 2] ----
 #
-# Coulomb logarithm: Plummer derivation.
-#   b_min = G*M_p/(v_circ^2 + sigma^2) = G*M_p*R0/M_enc(R0)
-#   b_max ~ R0
-#   => ln_Lambda = ln(M_enc(R0) / M_p)   [v_M = v_circ, leading order]
-# This replaces the SIS approximation ln_Lambda = ln(1/eta).
-ln_lambda_R0 = math.log(max(M_enc_R0 / M_pert, 1.1))
+# Coulomb logarithm: Plummer derivation, R-dependent.
+#   ln_Lambda(R) = ln(M_enc(R) / M_p)   floored at ln(1.1)
+#   This replaces both the SIS ln(1/eta) and the frozen ln_Lambda(R0).
+#
+# The ODE (derivation document Section 6):
+#   dR/dt = -6*(M_p+m)*lnL(R)*B_Plummer(R) / R^2 * (1+R^2)^(3/4) / (4+R^2)
+#
+# Integrated with Euler dt=0.01 — same method as summary_perturber.py.
+# Both lnL and B vary with R: internally consistent.
+# Lower bound: R_low = max(eps, 0.05) — perturber stalls below softening.
+# Upper bound on integration time: t_relax to avoid infinite loops.
 
-# DF deceleration at R0 using exact Plummer bracket and simplified form  [FIX 2]
-# a_DF = 3*(M_p+m)*ln_Lambda*B_Plummer / (R^2*(1+R^2))  (document Section 3)
-B0    = B_Plummer_fast(R0)
-B0    = max(B0, 1e-6)
-a_DF_R0 = 3.0 * (M_pert + mass_i) * ln_lambda_R0 * B0 / (R0**2 * (1.0 + R0**2))
+def ln_lam(R):
+    """R-dependent Coulomb log: ln(M_enc(R)/M_p), floored at ln(1.1)."""
+    Me = M_tot * R**3 / (R**2 + b**2)**1.5
+    return math.log(max(Me / M_pert, 1.1))
 
-# Full T_DF integral: document Section 7 with exact Plummer bracket     [FIX 2]
-# T_DF = (1/(6*(M_p+m)*lnL)) * int_{R_low}^{R0} R^2*(4+R^2)/(B_Plum*(1+R^2)^(3/4)) dR
-# Lower limit = eps (softening floor) to avoid the core-stalling 1/R divergence.
-R_low   = max(eps_recommended, 0.05)
-R_int   = np.linspace(R_low, R0, 600)
-B_int   = np.array([B_Plummer_fast(R) for R in R_int])
-with np.errstate(divide="ignore", invalid="ignore"):
-    integrand = np.where(
-        B_int > 1e-10,
-        R_int**2 * (4.0 + R_int**2) / (B_int * (1.0 + R_int**2) ** 0.75),
-        0.0,
-    )
-integral_val  = float(np.trapezoid(integrand, R_int))
-t_DF_Plummer  = integral_val / (6.0 * (M_pert + mass_i) * ln_lambda_R0)
+R_low = max(eps_recommended, 0.05)
+_DT_DF = 0.01          # Euler timestep — same as summary_perturber.py
+
+R_cur = R0
+t_DF_Plummer = 0.0
+while R_cur > R_low and t_DF_Plummer < t_relax:
+    B = B_Plummer_fast(R_cur)
+    if B < 1e-10:
+        break
+    dR = (-6.0 * (M_pert + mass_i) * ln_lam(R_cur) * B
+          / R_cur**2
+          * (1.0 + R_cur**2)**0.75
+          / (4.0 + R_cur**2))
+    R_cur = max(0.001, R_cur + dR * _DT_DF)
+    t_DF_Plummer += _DT_DF
+
+# a_DF at R0 for the JSON diagnostic (document Section 3)
+B0      = B_Plummer_fast(R0)
+B0      = max(B0, 1e-6)
+ln_lam0 = ln_lam(R0)
+a_DF_R0 = 3.0 * (M_pert + mass_i) * ln_lam0 * B0 / (R0**2 * (1.0 + R0**2))
 
 tstop_lower = max(5.0 * T_orb, 3.0 * t_DF_Plummer)
 tstop_upper = t_relax / 5.0
@@ -206,7 +216,7 @@ print(
 )
 print(f"  -> tstop_upper={tstop_upper:.1f}  (t_relax/5)")
 print(
-    f"  [Plummer DF: a_DF={a_DF_R0:.4e}  B_Plum(R0)={B0:.3f}  lnL={ln_lambda_R0:.3f}  t_DF(full)={t_DF_Plummer:.1f}]"
+    f"  [Plummer DF: a_DF={a_DF_R0:.4e}  B_Plum(R0)={B0:.3f}  lnL(R0)={ln_lam0:.3f}  t_DF(Euler)={t_DF_Plummer:.1f}]"
 )
 print(f"dtout={dtout}")
 
@@ -223,10 +233,10 @@ params = {
     "dtout": dtout,
     "theta": 0.50,
     "n_snapshots": int(tstop_recommended / dtout),
-    "t_DF_Plummer": round(t_DF_Plummer, 2),  # full integral, Section 7
+    "t_DF_Plummer": round(t_DF_Plummer, 2),  # Euler ODE, Section 6, both lnL and B varying
     "a_DF_R0": round(a_DF_R0, 6),
     "B0_Plummer": round(B0, 4),              # exact Plummer bracket at R0
-    "ln_lambda_R0": round(ln_lambda_R0, 4),
+    "ln_lambda_R0": round(ln_lam0, 4),
     "T_orb": round(T_orb, 4),
     "t_relax": round(t_relax, 1),
     "r_peri": round(r_peri, 6),
