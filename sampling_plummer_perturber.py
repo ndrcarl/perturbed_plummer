@@ -109,7 +109,7 @@ eps_winner = "background" if eps_background > eps_perturber else "perturber"
 
 # ---- dtime recommendation ----
 # Notes: dt = eta_acc * min(t_2body, t_potential)
-eta_acc = 0.05
+eta_acc = 0.5
 t_2body = eps_recommended / v_rel_rp  # softened crossing time
 t_potential = T_orb / (2.0 * math.pi)  # orbital timescale / 2pi
 dt_recommended = eta_acc * min(t_2body, t_potential)

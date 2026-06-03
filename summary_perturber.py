@@ -337,6 +337,29 @@ def anisotropy_profile(pos, vel, n_bins=15):
 
 # ---- snapshot reader ----
 
+import re as _re
+_FLOAT_RE = _re.compile(r'[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?')
+
+def _parse_floats(line):
+    """
+    Split a line into floats, handling Barnes treecode column-overflow.
+
+    The treecode uses fixed-width output with no guaranteed separator between
+    fields.  When a value is large (|x| >= 10) the sign of the next field can
+    fuse with the last digit of the previous one, producing tokens like
+    '3.33-2.1628068E-01' instead of '3.33 -2.1628068E-01'.
+
+    Strategy: try the fast path (str.split + float()) first; fall back to
+    regex tokenisation only when that raises ValueError.
+    """
+    tokens = line.split()
+    try:
+        return [float(t) for t in tokens]
+    except ValueError:
+        # Regex extracts every well-formed float sub-string, including the
+        # fused ones that str.split left as a single malformed token.
+        return [float(m) for m in _FLOAT_RE.findall(line)]
+
 
 def iter_snapshots(filepath, N_tot):
     with open(filepath, "r") as fh:
@@ -359,13 +382,25 @@ def iter_snapshots(filepath, N_tot):
                 continue
             for _ in range(N_tot):  # masses (discard)
                 fh.readline()
-            pos = np.array(
-                [[float(x) for x in fh.readline().split()] for _ in range(N_tot)]
-            )
-            vel = np.array(
-                [[float(x) for x in fh.readline().split()] for _ in range(N_tot)]
-            )
-            phi = np.array([float(fh.readline()) for _ in range(N_tot)])
+            # Read all three blocks as raw lines first, then parse.
+            # If any particle line yields != 3 floats (Barnes column-overflow
+            # severe enough to merge two rows), the whole snapshot is corrupt —
+            # skip it with a warning rather than crashing.
+            try:
+                pos_rows = [_parse_floats(fh.readline()) for _ in range(N_tot)]
+                vel_rows = [_parse_floats(fh.readline()) for _ in range(N_tot)]
+                phi_vals = [float(fh.readline())         for _ in range(N_tot)]
+                if any(len(r) != 3 for r in pos_rows) or \
+                   any(len(r) != 3 for r in vel_rows):
+                    print(f"[WARN] t={t:.4f}: corrupt snapshot (column overflow), skipping",
+                          flush=True)
+                    continue
+            except Exception as exc:
+                print(f"[WARN] t={t:.4f}: parse error ({exc}), skipping", flush=True)
+                continue
+            pos = np.array(pos_rows)
+            vel = np.array(vel_rows)
+            phi = np.array(phi_vals)
             yield t, pos, vel, phi
 
 
@@ -519,6 +554,36 @@ lagr_arr = np.array(lagr_arr)
 
 dE_over_E0 = np.abs((E_tot_arr - E0_total) / E0_total)
 DK_bg = K_bg_arr - K_bg_arr[0]
+
+# Sort all arrays by time — skipped corrupt snapshots can leave the times
+# array non-monotonic, which makes any line plot of a time series zigzag.
+_sort = np.argsort(times)
+if not np.all(_sort == np.arange(len(_sort))):
+    print(f"[WARN] times not monotonic — resorting {len(_sort)} snapshots", flush=True)
+    times        = times[_sort]
+    R_M          = R_M[_sort]
+    v_M          = v_M[_sort]
+    Lz_M         = Lz_M[_sort]
+    L_M          = L_M[_sort]
+    Lz_over_L    = Lz_over_L[_sort]
+    E_orb_M      = E_orb_M[_sort]
+    v_r_M        = v_r_M[_sort]
+    v_t_M        = v_t_M[_sort]
+    x_M_traj     = x_M_traj[_sort]
+    y_M_traj     = y_M_traj[_sort]
+    K_bg_arr     = K_bg_arr[_sort]
+    W_bg_arr     = W_bg_arr[_sort]
+    E_tot_arr    = E_tot_arr[_sort]
+    virial_arr   = virial_arr[_sort]
+    sigma_v_arr  = sigma_v_arr[_sort]
+    sigma_vr_arr = sigma_vr_arr[_sort]
+    sigma_vt_arr = sigma_vt_arr[_sort]
+    mean_vr_arr  = mean_vr_arr[_sort]
+    r_cm_bg_arr  = r_cm_bg_arr[_sort]
+    lagr_arr     = lagr_arr[_sort]
+    dE_over_E0   = dE_over_E0[_sort]
+    DK_bg        = DK_bg[_sort]
+
 dt_snap = float(np.median(np.diff(times))) if n_snaps > 1 else 1.0
 dR_dt = np.gradient(R_M, dt_snap)
 
