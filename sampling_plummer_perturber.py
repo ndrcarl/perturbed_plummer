@@ -109,7 +109,7 @@ eps_winner = "background" if eps_background > eps_perturber else "perturber"
 
 # ---- dtime recommendation ----
 # Notes: dt = eta_acc * min(t_2body, t_potential)
-eta_acc = 0.5
+eta_acc = 0.1
 t_2body = eps_recommended / v_rel_rp  # softened crossing time
 t_potential = T_orb / (2.0 * math.pi)  # orbital timescale / 2pi
 dt_recommended = eta_acc * min(t_2body, t_potential)
@@ -188,7 +188,7 @@ B0      = max(B0, 1e-6)
 ln_lam0 = ln_lam(R0)
 a_DF_R0 = 3.0 * (M_pert + mass_i) * ln_lam0 * B0 / (R0**2 * (1.0 + R0**2))
 
-tstop_lower = max(5.0 * T_orb, 3.0 * t_DF_Plummer)
+tstop_lower = max(5.0 * T_orb, t_DF_Plummer)
 tstop_upper = t_relax / 5.0
 tstop_raw = min(tstop_lower, tstop_upper)
 tstop_winner = (
@@ -196,7 +196,7 @@ tstop_winner = (
     if tstop_lower < tstop_upper
     else "upper bound (relaxation)"
 )
-tstop_recommended = max(10.0 * round(tstop_raw / 10.0), 10.0)
+tstop_recommended = 10.0 * round(tstop_raw / 10.0)
 
 # ---- random seed ----
 random.seed(42)
@@ -212,7 +212,7 @@ print(
 )
 print(f"tstop_recommended={tstop_recommended:.0f}  [won by {tstop_winner}]")
 print(
-    f"  -> tstop_lower={tstop_lower:.1f}  (5*T_orb={5 * T_orb:.1f}, 3*t_DF={3 * t_DF_Plummer:.1f})"
+    f"  -> tstop_lower={tstop_lower:.1f}  (5*T_orb={5 * T_orb:.1f}, t_DF={t_DF_Plummer:.1f})"
 )
 print(f"  -> tstop_upper={tstop_upper:.1f}  (t_relax/5)")
 print(
