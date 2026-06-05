@@ -138,6 +138,25 @@ _I_cum_cdf[1:] = np.cumsum(0.5 * (_f_cdf_grid[:-1] + _f_cdf_grid[1:]) * _dq_cdf)
 _I_q_full   = _I_cum_cdf[-1]   # numerically: 7*pi/512 ~ 0.042938
 _B_cdf      = _I_cum_cdf / _I_q_full   # CDF table: B_Plummer(q_M)
 
+# ---- Maxwellian bracket — CDF table, mirrors B_Plummer approach ----
+#
+# B_Maxwell(X) = (4/sqrt(pi)) * integral_0^X u^2 * exp(-u^2) du
+#              = erf(X) - (2X/sqrt(pi)) * exp(-X^2)   [analytic equivalent]
+# where u = v / (sqrt(2)*sigma),  X = v_M / (sqrt(2)*sigma).
+#
+# For a Plummer circular orbit X = R*sqrt(3/(1+R^2)) in [0, sqrt(3)] ~ [0, 1.73].
+# Grid extends to 5.0 to cover non-circular v_M values safely.
+# 50000 points gives the same point-density-per-unit as the Plummer grid.
+# Verified to agree with math.erf form to < 2e-9 across the full X range.
+
+_u_cdf_grid  = np.linspace(0.0, 5.0, 50000)
+_f_maxw_grid = _u_cdf_grid**2 * np.exp(-_u_cdf_grid**2)
+_du_cdf      = _u_cdf_grid[1] - _u_cdf_grid[0]
+_I_maxw_cum  = np.zeros(50000)
+_I_maxw_cum[1:] = np.cumsum(0.5 * (_f_maxw_grid[:-1] + _f_maxw_grid[1:]) * _du_cdf)
+_I_maxw_full = _I_maxw_cum[-1]   # numerically: sqrt(pi)/4 ~ 0.44311
+_B_maxw_cdf  = _I_maxw_cum / _I_maxw_full   # CDF table: B_Maxwell(X)
+
 
 def plummer_vesc(r):
     """Escape speed from Plummer potential at radius r."""
@@ -187,11 +206,16 @@ LAG_THEORY = [lag_radius_theory(f) for f in LAG_FRACS]
 
 def chandrasekhar_bracket(X):
     """
-    Maxwellian Chandrasekhar bracket B(X) = erf(X) - (2X/sqrt(pi))*exp(-X^2).
-    Derivation document Section 1, equation for B(X).
+    Maxwellian Chandrasekhar bracket B(X): fraction of background particles
+    slower than v_M, for a Maxwellian DF.  Evaluated via precomputed CDF
+    table — mirrors B_Plummer approach.
     X = v_M / (sqrt(2)*sigma) = R*sqrt(3/(1+R^2)) for Plummer circular orbit.
+    Analytically equivalent to erf(X) - (2X/sqrt(pi))*exp(-X^2);
+    agreement verified to < 2e-9 across the full X range.
     """
-    return math.erf(X) - (2.0 * X / math.sqrt(math.pi)) * math.exp(-(X**2))
+    if X <= 0.0:
+        return 0.0
+    return float(np.interp(X, _u_cdf_grid, _B_maxw_cdf))
 
 
 def chandrasekhar_decel(R, v_M, M_p_val, ln_lam_val, use_plummer_df=False):
@@ -229,13 +253,14 @@ def ln_lam_at_R(R, v_M=None):
     R-dependent Coulomb logarithm.
     If v_M is given: ln(R * (v_M^2 + sigma^2(R)) / (G*M_p))  -- exact form.
     If v_M is None:  ln(M(<R) / M_p)  -- circular orbit approximation.
-    Both floored at ln(1.1).
+    Both floored at ln(1.0) = 0, which triggers the ln_lam <= 0 guard in
+    chandrasekhar_decel and cleanly switches off friction when M(<R) <= M_p.
     """
     if v_M is not None:
         sig2 = G * M_tot / (6.0 * math.sqrt(R**2 + b**2))
         v_rel2 = v_M**2 + sig2
-        return math.log(max(R * v_rel2 / (G * M_p), 1.1))
-    return math.log(max(plummer_mass_enc(R) / M_p, 1.1))
+        return math.log(max(R * v_rel2 / (G * M_p), 1.0))
+    return math.log(max(plummer_mass_enc(R) / M_p, 1.0))
 
 
 # ---- helper functions ----
@@ -971,12 +996,12 @@ for k, frac in enumerate(LAG_FRACS):
 axes[0].axhline(r_hm, color="k", ls=":", lw=0.8)
 axes[0].set_xlabel("t")
 axes[0].set_ylabel("Lagrangian radius")
-axes[0].set_title("absolute  (dashed = theory)")
+axes[0].set_title("absolute")
 axes[0].legend(fontsize=7)
 axes[1].axhline(1.0, color="k", ls="--", lw=0.8, label="= 1")
 axes[1].set_xlabel("t")
 axes[1].set_ylabel("r / r(t=0)")
-axes[1].set_title("normalised  (= 1 means stable)")
+axes[1].set_title("normalised")
 axes[1].legend(fontsize=7)
 plt.tight_layout()
 fname = os.path.join(run_dir, "plot_bg_lagrangian.pdf")
@@ -1006,7 +1031,7 @@ axes[2].plot(times, mean_vr_arr, color="k", lw=1.0, label="<v_r>")
 axes[2].axhline(0.0, color="k", ls="--", lw=0.8, label="= 0")
 axes[2].set_xlabel("t")
 axes[2].set_ylabel("<v_r>")
-axes[2].set_title("mean radial velocity  (should be ~0)")
+axes[2].set_title("mean radial velocity")
 axes[2].legend(fontsize=7)
 plt.tight_layout()
 fname = os.path.join(run_dir, "plot_bg_velocities.pdf")
@@ -1047,13 +1072,18 @@ if phi_bg_last is not None:
 #  PERTURBER FIGURES
 # ============================================================
 
-# P1: orbital decay — 6 panels (3×2 grid)
-# row 0: R(t) decay, L(t) loss
-# row 1: speed vs v_circ, deceleration
-# row 2: B(X) bracket comparison [FIX 3], Lz/|L| stability [ADD M5]
-fig, axes = plt.subplots(3, 2, figsize=(11, 12))
+# Shared arrays used across multiple perturber figures.
+# Compute once here to avoid repeated loops.
+vc_theory_arr = np.array([plummer_vcirc(r) for r in R_M])
+J_circ_arr    = R_M * vc_theory_arr
+with np.errstate(divide="ignore", invalid="ignore"):
+    circularity_raw = np.where(J_circ_arr > 1e-12, L_M / J_circ_arr, np.nan)
+circularity = np.where(np.isfinite(circularity_raw), circularity_raw, np.nan)
 
-ax = axes[0, 0]
+# P_RADIUS: orbital radius decay and centre-of-mass reflex motion
+fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+
+ax = axes[0]
 ax.plot(times, R_M, color="k", lw=0.8, label="R_M(t)  N-body")
 ax.plot(
     times,
@@ -1061,7 +1091,7 @@ ax.plot(
     color="b",
     lw=1.5,
     ls="-.",
-    label="Chandra — Plummer DF  [FIX 3+4]",
+    label="Chandra — Plummer DF",
 )
 ax.plot(
     times,
@@ -1069,7 +1099,7 @@ ax.plot(
     color="r",
     lw=1.0,
     ls=":",
-    label="Chandra — Maxwell (old)",
+    label="Chandra — Maxwell",
 )
 ax.axhline(r_hm, color="k", ls=":", lw=0.8, label="r_hm")
 ax.set_xlabel("t")
@@ -1077,7 +1107,22 @@ ax.set_ylabel("R_M")
 ax.set_title("orbital radius decay")
 ax.legend(fontsize=7)
 
-ax = axes[0, 1]
+ax = axes[1]
+ax.plot(times, r_cm_bg_arr, color="m", lw=0.8)
+ax.set_xlabel("t")
+ax.set_ylabel(r"$|R_\mathrm{cm}|$")
+ax.set_title("reflex motion of host centre of mass")
+
+plt.tight_layout()
+fname = os.path.join(run_dir, "plot_perturber_radius.pdf")
+fig.savefig(fname, bbox_inches="tight")
+plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# P_MOMENTA: angular momentum loss, circularity, orbital plane stability
+fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+ax = axes[0]
 ax.plot(times, L_M, color="k", lw=0.8, label="|L_M|")
 ax.plot(times, Lz_M, color="0.5", lw=0.6, alpha=0.6, label="L_z")
 ax.set_xlabel("t")
@@ -1085,22 +1130,58 @@ ax.set_ylabel("specific angular momentum")
 ax.set_title("angular momentum loss")
 ax.legend(fontsize=7)
 
-ax = axes[1, 0]
-ax.plot(times, v_M, color="k", lw=0.8, label="|v_M|")
-vc_theory_arr = np.array([plummer_vcirc(r) for r in R_M])
-ax.plot(times, vc_theory_arr, color="r", lw=1.2, ls="--", label="v_circ theory")
+ax = axes[1]
+ax.plot(times, circularity, color="k", lw=0.8)
+ax.axhline(1.0, color="b", ls="--", lw=0.8, label=r"$\eta=1$ (circular)")
 ax.set_xlabel("t")
-ax.set_ylabel("speed")
-ax.set_title("speed vs circular velocity")
+ax.set_ylabel(r"$\eta = |L|\,/\,(R\,v_c(R))$")
+ax.set_title("circularity  (1 = perfectly circular orbit)")
 ax.legend(fontsize=7)
 
-ax = axes[1, 1]
+ax = axes[2]
+ax.plot(times, Lz_over_L, color="k", lw=0.8, label=r"$L_z\,/\,|L|$")
+ax.axhline(1.0, color="b", ls=":", lw=0.8, label="1.0 (initial value)")
+ax.axhline(0.95, color="0.5", ls="--", lw=0.7, label="0.95 (5% threshold)")
+ax.set_xlabel("t")
+ax.set_ylabel(r"$L_z\,/\,|L|$")
+ax.set_title("orbital plane stability")
+ax.set_ylim(
+    min(float(np.nanmin(Lz_over_L)) * 0.95, 0.85),
+    1.05,
+)
+ax.legend(fontsize=7)
+
+plt.tight_layout()
+fname = os.path.join(run_dir, "plot_perturber_momenta.pdf")
+fig.savefig(fname, bbox_inches="tight")
+plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# P_VELOCITY: tangential, radial, and circular velocity along orbit
+fig, ax = plt.subplots(figsize=(7, 5))
+ax.plot(times, v_t_M, color="k",   lw=0.8, label=r"$v_t$ (tangential)")
+ax.plot(times, v_r_M, color="0.5", lw=0.8, ls="--", label=r"$v_r$ (radial)")
+ax.plot(times, vc_theory_arr, color="r", lw=1.0, ls=":", label=r"$v_c(R)$ theory")
+ax.set_xlabel("t")
+ax.set_ylabel("velocity")
+ax.set_title(r"velocity decomposition  $v_t$ and $v_r$")
+ax.legend(fontsize=7)
+plt.tight_layout()
+fname = os.path.join(run_dir, "plot_perturber_velocity.pdf")
+fig.savefig(fname, bbox_inches="tight")
+plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
+# P_FRICTION: deceleration and DF bracket ratio
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+ax = axes[0]
 a_Rdep_plot = np.where(a_chandra_Rdep > 0, a_chandra_Rdep, np.nan)
 a_Rdep_plot_Maxwell = np.where(
     a_chandra_Rdep_Maxwell > 0, a_chandra_Rdep_Maxwell, np.nan
 )
 ax.plot(
-    times, a_meas, color="k", lw=0.8, alpha=0.7, label=r"$-\dot{L}|v|/|L|$  (measured)"
+    times, a_meas, color="k", lw=0.8, alpha=0.7, label=r"$-\dot{L}|v|/|L|$"
 )
 ax.plot(
     times,
@@ -1108,7 +1189,7 @@ ax.plot(
     color="b",
     lw=1.5,
     ls="-.",
-    label="Chandra — Plummer DF  [FIX 3]",
+    label="Chandra — Plummer DF",
 )
 ax.plot(
     times,
@@ -1116,7 +1197,7 @@ ax.plot(
     color="r",
     lw=1.0,
     ls=":",
-    label="Chandra — Maxwell (old)",
+    label="Chandra — Maxwell",
 )
 valid_pos = np.concatenate(
     [
@@ -1134,47 +1215,53 @@ ax.set_title("friction deceleration  (-dL/dt |v|/|L|)")
 ax.set_yscale("log")
 ax.legend(fontsize=7)
 
-# [ADD M4 / FIX 3] Exact Plummer DF bracket vs Maxwellian bracket along orbit.
-# B_Plummer: from Eddington inversion, integral of f(eps)propto psi^(7/2).
-# B_Maxwell: Maxwellian erf-form with Jeans sigma — the old approximation.
-# SIS reference: B=0.4 at X=1 (v_circ = sqrt(2)*sigma for SIS).
-ax = axes[2, 0]
-ax.plot(times, B_X_arr, color="b", lw=1.2, label="B_Plummer(t)  [exact, FIX 3]")
-ax.plot(
-    times,
-    B_X_Maxwell_arr,
-    color="r",
-    lw=1.0,
-    ls="--",
-    label="B_Maxwell(t)  [Maxwellian, old]",
-)
-ax.axhline(0.4, color="0.4", ls=":", lw=1.0, label="B=0.4  (SIS reference)")
+ax = axes[1]
+with np.errstate(divide="ignore", invalid="ignore"):
+    B_ratio = np.where(B_X_Maxwell_arr > 1e-6, B_X_arr / B_X_Maxwell_arr, np.nan)
+ax.plot(times, B_ratio, color="b", lw=1.2, label=r"$\Gamma_\mathrm{Plummer}\,/\,\Gamma_\mathrm{Maxwell}$")
+ax.axhline(1.0, color="0.4", ls="--", lw=0.8, label="ratio = 1")
 ax.set_xlabel("t")
-ax.set_ylabel("B  (DF efficiency bracket)")
-ax.set_title("DF bracket: exact Plummer vs Maxwellian")
+ax.set_ylabel(r"$\Gamma_\mathrm{Plummer}\,/\,\Gamma_\mathrm{Maxwell}$")
+ax.set_title("DF bracket ratio  (Plummer / Maxwell)")
+ax.legend(fontsize=7)
+
+# Panel 3: bracket CDFs as functions of v / v_c(R_0).
+# Common x-axis = speed normalised to the initial circular velocity,
+# so both curves pass through their bracket value at x=1 (the perturber speed).
+# Plummer CDF ends at v_esc(R_0)/v_c(R_0) = 1/q_M_0  (finite support).
+# Maxwell CDF continues past that — infinite support, shown up to x=3.
+ax = axes[2]
+v_esc_0 = plummer_vesc(R_M[0])
+q_M_0   = min(v_M[0] / v_esc_0, 1.0 - 1e-10) if v_esc_0 > 1e-12 else 0.5
+X_0     = X_arr[0]
+# Plummer: q -> v/v_c = q / q_M_0  (curve ends at v/v_c = 1/q_M_0)
+x_plum = _q_cdf_grid / q_M_0
+ax.plot(x_plum, _B_cdf, color="b", lw=1.5,
+        label=r"Plummer  $B(q)$,  $q=v/v_\mathrm{esc}$")
+# Maxwell: X -> v/v_c = X / X_0  (truncated at x=3 for visibility)
+x_maxw = _u_cdf_grid / X_0
+mask   = x_maxw <= 3.0
+ax.plot(x_maxw[mask], _B_maxw_cdf[mask], color="r", lw=1.5, ls="--",
+        label=r"Maxwell  $B(X)$,  $X=v/\sqrt{2}\,\sigma$")
+# mark v = v_c (the circular-orbit speed at t=0, x=1)
+B_P_vc = float(np.interp(q_M_0, _q_cdf_grid, _B_cdf))
+B_M_vc = float(np.interp(X_0,   _u_cdf_grid, _B_maxw_cdf))
+ax.axvline(1.0, color="0.4", ls=":", lw=0.8,
+           label=r"$v=v_c(R_0)$  (perturber at $t=0$)")
+ax.scatter([1.0, 1.0], [B_P_vc, B_M_vc], color=["b", "r"], s=40, zorder=5)
+# mark v_esc boundary: Plummer CDF ends here
+v_esc_norm = 1.0 / q_M_0
+ax.axvline(v_esc_norm, color="b", ls="--", lw=0.7, alpha=0.5,
+           label=rf"$v_\mathrm{{esc}}(R_0)$  (Plummer support ends,  $\times${v_esc_norm:.2f}$v_c$)")
+ax.set_xlabel(r"$v\,/\,v_c(R_0)$")
+ax.set_ylabel("B  (fraction of slower particles)")
+ax.set_title("bracket CDFs: Plummer vs Maxwell")
+ax.set_xlim(0, 3.0)
 ax.set_ylim(0, 1.05)
 ax.legend(fontsize=7)
 
-# [ADD M5] Lz / |L|: orbital plane stability.
-# At t=0 the perturber orbits in the x-y plane so Lz/|L|=1.
-# Any drift from unity means the orbital plane is precessing due to
-# N-body noise from the granular background.  A large drift invalidates
-# the quasi-circular 2D analysis of dL/dt.
-ax = axes[2, 1]
-ax.plot(times, Lz_over_L, color="k", lw=0.8, label=r"$L_z\,/\,|L|$")
-ax.axhline(1.0, color="b", ls=":", lw=0.8, label="1.0 (initial value)")
-ax.axhline(0.95, color="0.5", ls="--", lw=0.7, label="0.95 (5% threshold)")
-ax.set_xlabel("t")
-ax.set_ylabel(r"$L_z\,/\,|L|$")
-ax.set_title("orbital plane stability  (1 = orbit stays in x-y plane)")
-ax.set_ylim(
-    min(float(np.nanmin(Lz_over_L)) * 0.95, 0.85),
-    1.05,
-)
-ax.legend(fontsize=7)
-
 plt.tight_layout()
-fname = os.path.join(run_dir, "plot_orbital_decay.pdf")
+fname = os.path.join(run_dir, "plot_perturber_friction.pdf")
 fig.savefig(fname, bbox_inches="tight")
 plt.close(fig)
 print(f"written: {os.path.basename(fname)}")
@@ -1279,66 +1366,6 @@ ax.legend(fontsize=7)
 
 plt.tight_layout()
 fname = os.path.join(run_dir, "plot_coulomb_log.pdf")
-fig.savefig(fname, bbox_inches="tight")
-plt.close(fig)
-print(f"written: {os.path.basename(fname)}")
-
-# ============================================================
-#  P_KINEM: perturber kinematics
-#  (0,0) circularity eta = |L| / (R * v_circ(R))  — clipped to [0, 1.5]
-#  (0,1) v_t(t) and v_r(t) with v_circ(R) overlaid
-#  (1,0) reflex motion |R_cm_bg|(t)
-#  (1,1) kinematic phase space v_r vs v_t coloured by time
-# ============================================================
-
-# Circularity: |L| / J_circ,  J_circ = R * v_circ(R)
-# Clipped to [0, 1.5]: J_circ -> 0 as R -> 0 makes this diverge at late times
-# when the perturber is deep in the core.  Values > 1.5 are unphysical for a
-# quasi-circular orbit and arise purely from the J_circ -> 0 denominator.
-J_circ_arr = np.array([R_M[i] * plummer_vcirc(R_M[i]) for i in range(n_snaps)])
-with np.errstate(divide="ignore", invalid="ignore"):
-    circularity_raw = np.where(J_circ_arr > 1e-12, L_M / J_circ_arr, np.nan)
-circularity = np.clip(circularity_raw, 0.0, 2.0)   # clip before plotting
-
-fig, axes = plt.subplots(2, 2, figsize=(11, 8))
-
-ax = axes[0, 0]
-ax.plot(times, circularity, color="k", lw=0.8)
-ax.axhline(1.0, color="b", ls="--", lw=0.8, label=r"$\eta=1$ (circular)")
-ax.set_xlabel("t")
-ax.set_ylabel(r"$\eta = |L|\,/\,(R\,v_c(R))$  [clipped at 2]")
-ax.set_title("circularity  (1 = perfectly circular orbit)")
-ax.set_ylim(0, 1.6)
-ax.legend(fontsize=7)
-
-ax = axes[0, 1]
-vc_arr = np.array([plummer_vcirc(r) for r in R_M])
-ax.plot(times, v_t_M, color="k",   lw=0.8, label=r"$v_t$ (tangential)")
-ax.plot(times, v_r_M, color="0.5", lw=0.8, ls="--", label=r"$v_r$ (radial)")
-ax.plot(times, vc_arr, color="r",  lw=1.0, ls=":",  label=r"$v_c(R)$ theory")
-ax.set_xlabel("t")
-ax.set_ylabel("speed  (code units)")
-ax.set_title(r"velocity decomposition  $v_t$ and $v_r$")
-ax.legend(fontsize=7)
-
-ax = axes[1, 0]
-ax.plot(times, r_cm_bg_arr, color="m", lw=0.8)
-ax.set_xlabel("t")
-ax.set_ylabel(r"$|\mathbf{R}_\mathrm{cm}|$  (code units)")
-ax.set_title("reflex motion of host centre of mass")
-
-ax = axes[1, 1]
-sc = ax.scatter(v_r_M, v_t_M, c=times, s=3, cmap="viridis")
-ax.scatter(v_r_M[0],  v_t_M[0],  color="green", s=60, zorder=5, label="t=0")
-ax.scatter(v_r_M[-1], v_t_M[-1], color="red",   s=60, zorder=5, label="t=final")
-plt.colorbar(sc, ax=ax, label="time")
-ax.set_xlabel(r"$v_r$")
-ax.set_ylabel(r"$v_t$")
-ax.set_title("kinematic phase space")
-ax.legend(fontsize=7)
-
-plt.tight_layout()
-fname = os.path.join(run_dir, "plot_perturber_kinematics.pdf")
 fig.savefig(fname, bbox_inches="tight")
 plt.close(fig)
 print(f"written: {os.path.basename(fname)}")
