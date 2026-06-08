@@ -13,6 +13,16 @@
 #           eps and dt to be slightly underestimated.
 #
 #   [FIX 2] tstop lower bound: SIS formula -> Euler ODE for T_DF.
+#
+#   [FIX 3] eps_perturber: evaluate at the worst-case radius, not R0.
+#           The teacher's prescription is eps = alpha * min_R [ G*M_p/(v_M^2+sigma^2) ],
+#           i.e. use the MAXIMUM of v_M^2 + sigma^2 over the inspiral [R_stall, R0].
+#           v_M is approximated by v_circ(R) a priori (quasi-circular inspiral).
+#           With G=M_tot=b=1, f(R) = v_circ^2 + sigma^2 = (1+7R^2)/(6*(1+R^2)^(3/2)),
+#           which has an analytical peak at R_peak = sqrt(11/7) ~ 1.253.
+#           R_stall (where M_enc = M_p, friction switches off) is now computed
+#           before eps so it can bound the search: R_worst = clamp(R_peak, R_stall, R0).
+#           eps_recommended now correctly takes min(eps_bg, eps_pert) not max.
 #           The SIS formula  t_DF = R0^2*v_circ / (0.8*G*M_p*ln_Lambda)  assumes
 #           v_circ = const and uses ln_Lambda = ln(1/eta), neither of which holds
 #           for a Plummer sphere.
@@ -92,20 +102,46 @@ sigma2_rp = sigma2_R0
 v_tang_rp = v_circ_R0
 
 # [FIX 1] v_rel: quadrature sum, not linear sum.
-# Notes write  eps = alpha * G*M_BH / (v_BH^2 + sigma^2),
-# so the characteristic relative speed satisfies  v_rel^2 = v_M^2 + sigma^2.
-# The old  v_rel = v_M + sigma  overestimated by ~36%, causing eps and dt to
-# be slightly underestimated.
 v_rel_rp = math.sqrt(v_tang_rp**2 + sigma2_rp)  # [FIX 1]
 
-# ---- eps recommendation ----
-# Notes: eps ~ min(alpha*d_mean, alpha*r_inf) with r_inf = G*M_p/(v^2+sigma^2)
+# ---- R_stall: radius where M_enc(R) = M_p, Coulomb log -> 0 [FIX 3] ----
+# Computed here (before eps) because R_worst below is clamped to [R_stall, R0].
+# Only depends on M_tot, M_pert, b — all known at this point.
+_lo_stall, _hi_stall = 1e-4, R0
+for _ in range(100):
+    _mid_stall = 0.5 * (_lo_stall + _hi_stall)
+    if M_tot * _mid_stall**3 / (_mid_stall**2 + b**2)**1.5 < M_pert:
+        _lo_stall = _mid_stall
+    else:
+        _hi_stall = _mid_stall
+R_stall_eps = 0.5 * (_lo_stall + _hi_stall)   # preliminary; reused in tstop block
+
+# ---- eps recommendation [FIX 3] ----
+# Teacher's prescription: eps = alpha * min_R [ G*M_p / (v_M^2 + sigma^2) ]
+#                              = alpha * G*M_p / max_R [ v_circ^2(R) + sigma^2(R) ]
+# where v_M ~ v_circ(R) a priori (quasi-circular inspiral; any v_r only tightens eps).
+#
+# With G = M_tot = b = 1:
+#   f(R) = v_circ^2(R) + sigma^2(R) = (1 + 7*R^2) / (6*(1+R^2)^(3/2))
+# Analytical peak: df/dR = 0  =>  R_peak = sqrt(11/7) ~ 1.253
+#
+# The inspiral runs from R0 down to R_stall, so the maximum of f over the
+# actual trajectory is at clamp(R_peak, R_stall, R0):
+#   R0    < R_peak : orbit starts below the peak -> worst case at R0
+#   R_stall > R_peak: orbit never reaches the peak -> worst case at R_stall
+#   otherwise      : orbit crosses the peak      -> worst case at R_peak
 alpha_eps = 0.1
-eps_background = 0.1 * d_mean
-r_inf_peri = G * M_pert / (v_tang_rp**2 + sigma2_rp)
-eps_perturber = alpha_eps * r_inf_peri
-eps_recommended = max(eps_background, eps_perturber)
-eps_winner = "background" if eps_background > eps_perturber else "perturber"
+R_peak_f  = math.sqrt(11.0 / 7.0)                           # ~ 1.253
+R_worst   = max(R_stall_eps, min(R_peak_f, R0))             # clamp to inspiral range
+
+v_circ_worst = math.sqrt(G * M_tot * R_worst**2 / (R_worst**2 + b**2)**1.5)
+sigma2_worst  = G * M_tot / (6.0 * math.sqrt(R_worst**2 + b**2))
+r_inf_worst   = G * M_pert / (v_circ_worst**2 + sigma2_worst)
+
+eps_background = alpha_eps * d_mean
+eps_perturber  = alpha_eps * r_inf_worst
+eps_recommended = min(eps_background, eps_perturber)        # min: both are upper bounds
+eps_winner = "background" if eps_background < eps_perturber else "perturber"
 
 # ---- dtime recommendation ----
 # Notes: dt = eta_acc * min(t_2body, t_potential)
@@ -137,6 +173,32 @@ _I_c[1:] = np.cumsum(0.5 * (_f_cdf[:-1] + _f_cdf[1:]) * _dq_cdf)
 _I_q_full_s = _I_c[-1]          # ~ 0.042938
 _B_cdf_s    = _I_c / _I_q_full_s
 
+# ---- Maxwellian bracket — CDF table, mirrors B_Plummer approach ----
+# B_Maxwell(X) = (4/sqrt(pi)) * integral_0^X u^2 * exp(-u^2) du
+# Analytically: erf(X) - (2X/sqrt(pi))*exp(-X^2)  [equivalent by construction]
+# u = v / (sqrt(2)*sigma),  X = v_M / (sqrt(2)*sigma)
+# Table truncated at u=5: B(5) = 1 to < 1e-10.  50k points → same point
+# density per unit as the Plummer grid.
+_u_cdf      = np.linspace(0.0, 5.0, 50000)
+_f_maxw_cdf = _u_cdf**2 * np.exp(-_u_cdf**2)
+_du_cdf     = _u_cdf[1] - _u_cdf[0]
+_I_m        = np.zeros(50000)
+_I_m[1:]    = np.cumsum(0.5 * (_f_maxw_cdf[:-1] + _f_maxw_cdf[1:]) * _du_cdf)
+_I_maxw_full_s = _I_m[-1]       # = sqrt(pi)/4 ~ 0.44311
+_B_maxw_s      = _I_m / _I_maxw_full_s
+
+
+def chandrasekhar_bracket(X):
+    """
+    Maxwellian bracket B(X): fraction of background particles slower than v_M.
+    Evaluated via precomputed CDF table — mirrors B_Plummer approach.
+    X = v_M / (sqrt(2)*sigma) = R*sqrt(3/(1+R^2)) for Plummer circular orbit.
+    Analytically equivalent to erf(X) - (2X/sqrt(pi))*exp(-X^2).
+    """
+    if X <= 0.0:
+        return 0.0
+    return float(np.interp(X, _u_cdf, _B_maxw_s))
+
 
 def B_Plummer_fast(R_val):
     """Exact Plummer bracket at v_M = v_circ(R_val), via CDF interpolation."""
@@ -150,8 +212,8 @@ def B_Plummer_fast(R_val):
 # ---- tstop recommendation — Euler ODE for T_DF                      [FIX 2] ----
 #
 # Coulomb logarithm: Plummer derivation, R-dependent.
-#   ln_Lambda(R) = ln(M_enc(R) / M_p)   floored at ln(1.1)
-#   This replaces both the SIS ln(1/eta) and the frozen ln_Lambda(R0).
+#   ln_Lambda(R) = ln(M_enc(R) / M_p)   floored at ln(1.0) = 0
+#   Friction switches off cleanly at R_stall where M_enc = M_p.
 #
 # The ODE (derivation document Section 6):
 #   dR/dt = -6*(M_p+m)*lnL(R)*B_Plummer(R) / R^2 * (1+R^2)^(3/4) / (4+R^2)
@@ -162,25 +224,54 @@ def B_Plummer_fast(R_val):
 # Upper bound on integration time: t_relax to avoid infinite loops.
 
 def ln_lam(R):
-    """R-dependent Coulomb log: ln(M_enc(R)/M_p), floored at ln(1.1)."""
+    """R-dependent Coulomb log: ln(M_enc(R)/M_p), floored at ln(1.0) = 0.
+    Returns 0.0 when M_enc(R) <= M_p — friction switches off cleanly at R_stall
+    (the radius where the Chandrasekhar formula becomes invalid)."""
     Me = M_tot * R**3 / (R**2 + b**2)**1.5
-    return math.log(max(Me / M_pert, 1.1))
+    return math.log(max(Me / M_pert, 1.0))
 
 R_low = max(eps_recommended, 0.05)
+
+# R_stall: already computed above (before eps) — reuse it here.
+R_stall = R_stall_eps
+_R_low_ode = max(R_stall, R_low)   # stop at whichever physical boundary comes first
+
 _DT_DF = 0.01          # Euler timestep — same as summary_perturber.py
 
 R_cur = R0
 t_DF_Plummer = 0.0
-while R_cur > R_low and t_DF_Plummer < t_relax:
+while R_cur > _R_low_ode * (1.0 + 1e-4) and t_DF_Plummer < t_relax:
+    lnL = ln_lam(R_cur)
+    if lnL <= 0.0:
+        break
     B = B_Plummer_fast(R_cur)
     if B < 1e-10:
         break
-    dR = (-6.0 * (M_pert + mass_i) * ln_lam(R_cur) * B
+    dR = (-6.0 * (M_pert + mass_i) * lnL * B
           / R_cur**2
           * (1.0 + R_cur**2)**0.75
           / (4.0 + R_cur**2))
-    R_cur = max(0.001, R_cur + dR * _DT_DF)
+    R_cur = max(_R_low_ode, R_cur + dR * _DT_DF)
     t_DF_Plummer += _DT_DF
+
+# Maxwell bracket — same ODE, same stopping condition, for comparison.
+# X(R) = R * sqrt(3/(1+R^2))  exact for Plummer+Jeans sigma.
+R_cur = R0
+t_DF_Maxwell = 0.0
+while R_cur > _R_low_ode * (1.0 + 1e-4) and t_DF_Maxwell < t_relax:
+    lnL = ln_lam(R_cur)
+    if lnL <= 0.0:
+        break
+    X = R_cur * math.sqrt(3.0 / (1.0 + R_cur**2))
+    B = chandrasekhar_bracket(X)
+    if B < 1e-10:
+        break
+    dR = (-6.0 * (M_pert + mass_i) * lnL * B
+          / R_cur**2
+          * (1.0 + R_cur**2)**0.75
+          / (4.0 + R_cur**2))
+    R_cur = max(_R_low_ode, R_cur + dR * _DT_DF)
+    t_DF_Maxwell += _DT_DF
 
 # a_DF at R0 for the JSON diagnostic (document Section 3)
 B0      = B_Plummer_fast(R0)
@@ -218,6 +309,7 @@ print(f"  -> tstop_upper={tstop_upper:.1f}  (t_relax/5)")
 print(
     f"  [Plummer DF: a_DF={a_DF_R0:.4e}  B_Plum(R0)={B0:.3f}  lnL(R0)={ln_lam0:.3f}  t_DF(Euler)={t_DF_Plummer:.1f}]"
 )
+print(f"  [Maxwell DF: t_DF(Euler)={t_DF_Maxwell:.1f}  (ratio Plummer/Maxwell={t_DF_Plummer/t_DF_Maxwell:.3f})]")
 print(f"dtout={dtout}")
 
 # ---- write params JSON ----
@@ -234,6 +326,7 @@ params = {
     "theta": 0.50,
     "n_snapshots": int(tstop_recommended / dtout),
     "t_DF_Plummer": round(t_DF_Plummer, 2),  # Euler ODE, Section 6, both lnL and B varying
+    "t_DF_Maxwell": round(t_DF_Maxwell, 2),  # same ODE with Maxwellian bracket (comparison)
     "a_DF_R0": round(a_DF_R0, 6),
     "B0_Plummer": round(B0, 4),              # exact Plummer bracket at R0
     "ln_lambda_R0": round(ln_lam0, 4),

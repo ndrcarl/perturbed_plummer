@@ -18,6 +18,18 @@
 #   [FIX 4]  ODE uses document Section 6 formula directly:
 #              dR/dt = -6*(M_p+m)*lnL*B(X(R))/R^2 * (1+R^2)^(3/4)/(4+R^2)
 #            integrated with Euler dt=0.01 (document Section 10).
+#   [FIX 5]  chandrasekhar_decel now uses the exact Chandrasekhar formula at
+#            the actual perturber speed v_M, not the circular-orbit approximation:
+#              a_DF = 3*(M_p+m)*lnL*B(v_M) / (v_M^2 * (1+R^2)^(5/2))
+#            The old form 3*(M_p+m)*lnL*B / (R^2*(1+R^2)) is equivalent only
+#            when v_M = v_circ = R/(1+R^2)^(3/4).  Using v_circ^2 instead of
+#            v_M^2 in the denominator caused lnlam_eff to carry a spurious
+#            factor of v_circ^2/v_M^2, which oscillates at the orbital frequency
+#            and is the dominant source of noise in plot_coulomb_log.pdf.
+#            The Maxwell branch X argument is also fixed to v_M/(sqrt(2)*sigma(R))
+#            instead of the circular-orbit form R*sqrt(3/(1+R^2)).
+#            The Euler ODE in _chandra_ode_euler has its own hardcoded circular-
+#            orbit formula and does NOT call chandrasekhar_decel; it is unchanged.
 
 import numpy as np
 import matplotlib
@@ -220,16 +232,28 @@ def chandrasekhar_bracket(X):
 
 def chandrasekhar_decel(R, v_M, M_p_val, ln_lam_val, use_plummer_df=False):
     """
-    DF deceleration magnitude at radius R.
+    DF deceleration magnitude at radius R, using the actual perturber speed v_M.
 
-    Derivation document Section 3 — simplified Plummer form (default):
-        a_DF(R) = 3*(M_p+m)*lnL*B(X) / (R^2*(1+R^2))
-        X(R)    = R * sqrt(3/(1+R^2))          [exact for Plummer + Jeans sigma]
-        B(X)    = erf(X) - (2X/sqrt(pi))*exp(-X^2)   [Maxwellian bracket]
+    [FIX 5] Exact Chandrasekhar formula, valid for any v_M (not just circular):
+        a_DF = 4π G² (M_p+m) ρ(R) lnΛ B(v_M) / v_M²
 
-    use_plummer_df=True — exact Plummer DF bracket (kept for comparison):
-        B_Plummer(R) = int_0^{q_M} q^2*(1-q^2)^(7/2) dq / I_q_full
-        Numerically equivalent to B(X) to within ~3-25% depending on radius.
+    For the Plummer sphere (G = M_tot = b = 1):
+        ρ(R) = 3/(4π) · (1 + R²)^{-5/2}
+
+    so the formula simplifies to:
+        a_DF = 3·(M_p+m)·lnΛ·B(v_M) / (v_M² · (1 + R²)^{5/2})
+
+    The previous form  3·(M_p+m)·lnΛ·B / (R²·(1+R²))  is recovered only when
+    v_M equals the circular speed v_circ = R·(1+R²)^{-3/4}.  Using v_circ² in
+    the denominator instead of the actual v_M² introduced a spurious factor of
+    v_circ²/v_M² into lnlam_eff, oscillating at the orbital frequency.
+
+    Note: _chandra_ode_euler has its own hardcoded circular-orbit formula and
+    does NOT call this function, so the secular inspiral ODE is unaffected.
+
+    use_plummer_df=True  — exact Plummer DF bracket B_Plummer(R, v_M)
+    use_plummer_df=False — Maxwellian bracket with X = v_M / (sqrt(2)·σ(R))
+                          [FIX 5: X now uses actual v_M, not R·sqrt(3/(1+R²))]
     """
     if R <= 0.0 or v_M <= 0.0 or ln_lam_val <= 0.0:
         return 0.0
@@ -237,15 +261,17 @@ def chandrasekhar_decel(R, v_M, M_p_val, ln_lam_val, use_plummer_df=False):
         B = B_Plummer(R, v_M)
         if B <= 0.0:
             return 0.0
-        # still use document's simplified rho/v_circ^2 = 3/(4pi*R^2*(1+R^2))
-        return 3.0 * M_p_val * ln_lam_val * B / (R**2 * (1.0 + R**2))
     else:
-        # Document Section 3: X(R) = R*sqrt(3/(1+R^2)), exact for Plummer+Jeans
-        X = R * math.sqrt(3.0 / (1.0 + R**2))
+        # [FIX 5] Use actual v_M to compute X, not the circular-orbit shortcut
+        # X = v_circ / (sqrt(2)*sigma) = R*sqrt(3/(1+R²)) only when v_M = v_circ.
+        sig2 = G * M_tot / (6.0 * math.sqrt(R**2 + b**2))
+        sigma = math.sqrt(max(sig2, 0.0))
+        X = v_M / (math.sqrt(2.0) * sigma) if sigma > 1e-30 else 0.0
         B = chandrasekhar_bracket(X)
         if B <= 0.0:
             return 0.0
-        return 3.0 * M_p_val * ln_lam_val * B / (R**2 * (1.0 + R**2))
+    # [FIX 5] ρ_Plummer(R) = 3/(4π)·(1+R²)^{-5/2}  →  4π·ρ/v_M² = 3/(v_M²·(1+R²)^{5/2})
+    return 3.0 * M_p_val * ln_lam_val * B / (v_M**2 * (1.0 + R**2)**2.5)
 
 
 def ln_lam_at_R(R, v_M=None):
@@ -704,13 +730,26 @@ with np.errstate(divide="ignore", invalid="ignore"):
 # The N-body trajectory R_M(t) is NEVER used after the initial condition R_0;
 # the two curves (theory and simulation) evolve independently.
 
+# R_stall: radius where M_enc(R) = M_p → lnΛ = 0 → Chandrasekhar friction off.
+# Physical boundary of formula validity; solved by bisection.
+_lo_s, _hi_s = 1e-4, R_M[0]
+for _ in range(100):
+    _mid_s = 0.5 * (_lo_s + _hi_s)
+    if plummer_mass_enc(_mid_s) < M_p:
+        _lo_s = _mid_s
+    else:
+        _hi_s = _mid_s
+R_stall = 0.5 * (_lo_s + _hi_s)
+
 _DT_FINE = 0.01  # fixed fine timestep for Euler integration
 
 
-def _chandra_ode_euler(use_plummer_df):
+def _chandra_ode_euler(use_plummer_df, lnL_floor=0.0):
     """
     Euler integration of dR/dt = f(R) with dt=_DT_FINE.
     Outputs R at the snapshot times by linear interpolation.
+    lnL_floor=0.0  (default): stops at R_stall where lnL=0 — use for t_DF.
+    lnL_floor>0.0           : continues below R_stall — use for plot curves only.
     """
     t_fine = np.arange(times[0], times[-1] + _DT_FINE, _DT_FINE)
     R_fine = np.empty(len(t_fine))
@@ -721,16 +760,15 @@ def _chandra_ode_euler(use_plummer_df):
         if R_cur < 0.01:
             R_fine[i] = R_cur
             continue
-        # Document Section 6 — ODE RHS evaluated directly:
-        #   dR/dt = -6*(M_p+m)*lnL(R)*B(X(R)) / R^2  *  (1+R^2)^(3/4) / (4+R^2)
-        # X(R) = R*sqrt(3/(1+R^2)),  B(X) = erf(X) - (2X/sqrt(pi))*exp(-X^2)
-        # This avoids calling chandrasekhar_decel + plummer_dLdR separately.
         if use_plummer_df:
             B = B_Plummer(R_cur)
         else:
             X = R_cur * math.sqrt(3.0 / (1.0 + R_cur**2))
             B = chandrasekhar_bracket(X)
-        ln_lam = ln_lam_at_R(R_cur)
+        ln_lam = max(ln_lam_at_R(R_cur), lnL_floor)
+        if ln_lam <= 0.0:
+            R_fine[i] = R_cur
+            continue
         dR = (
             -6.0
             * (M_p + m_bg)
@@ -743,12 +781,17 @@ def _chandra_ode_euler(use_plummer_df):
         R_cur = max(0.01, R_cur + dR * _DT_FINE)
         R_fine[i] = R_cur
 
-    # interpolate onto snapshot times for plotting
     return np.interp(times, t_fine, R_fine)
 
 
-R_chandra_Rdep = _chandra_ode_euler(use_plummer_df=True)  # [FIX 3+4]
-R_chandra_Rdep_Maxwell = _chandra_ode_euler(use_plummer_df=False)  # comparison
+# floor=0.0: stops at R_stall — used for t_DF and stats
+R_chandra_Rdep        = _chandra_ode_euler(use_plummer_df=True)
+R_chandra_Rdep_Maxwell = _chandra_ode_euler(use_plummer_df=False)
+
+# floor=ln(1.1): continues below R_stall — used for plot only (extrapolation)
+_lnL_plot_floor = math.log(1.1)
+R_chandra_Rdep_plot        = _chandra_ode_euler(use_plummer_df=True,  lnL_floor=_lnL_plot_floor)
+R_chandra_Rdep_Maxwell_plot = _chandra_ode_euler(use_plummer_df=False, lnL_floor=_lnL_plot_floor)
 
 # ============================================================
 #  DERIVED DIAGNOSTICS — BACKGROUND
@@ -844,35 +887,57 @@ chi2_sigt, p_sigt = compute_reduced_chi2(sigt_chi, sig_th_jchi, sig_err_jchi)
 #  BACKGROUND FIGURES
 # ============================================================
 
-# BG3: density profile initial / mid / final
+# BG3: density profile initial / mid / final  +  fractional residuals (bottom row)
 r_theory = np.logspace(-1.5, 1.5, 300)
 rho_th_plot = np.array([plummer_rho(r) for r in r_theory])
 
-fig, axes = plt.subplots(1, 3, figsize=(14, 5))
-for ax, pos_s, label in [
-    (axes[0], pos_bg_initial, "t=0"),
-    (axes[1], pos_bg_mid, f"t={t_mid_actual:.2f}"),
-    (axes[2], pos_bg_last, f"t={times[-1]:.2f}"),
-]:
+fig, axes = plt.subplots(2, 3, figsize=(14, 9),
+                         gridspec_kw={"height_ratios": [3, 1.8]})
+for col, (pos_s, label) in enumerate([
+    (pos_bg_initial,    "t=0"),
+    (pos_bg_mid,        f"t={t_mid_actual:.2f}"),
+    (pos_bg_last,       f"t={times[-1]:.2f}"),
+]):
+    ax_top = axes[0, col]
+    ax_bot = axes[1, col]
     r_m, rho_m, cnts = bin_density_profile(pos_s)
+
+    # ---- top: absolute density ----
     if r_m is not None:
         log_sig = 1.0 / np.sqrt(cnts)
-        ax.errorbar(
-            r_m,
-            rho_m,
-            yerr=[rho_m * (1.0 - 10.0 ** (-log_sig)), rho_m * (10.0**log_sig - 1.0)],
-            fmt="o",
-            ms=3,
-            color="k",
-            label="N-body",
-        )
-    ax.plot(r_theory, rho_th_plot, "r--", label="Plummer theory")
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("r")
-    ax.set_title(label)
-    ax.legend(fontsize=7)
-axes[0].set_ylabel("density")
+        ax_top.errorbar(r_m, rho_m,
+                        yerr=[rho_m*(1.0 - 10.0**(-log_sig)),
+                              rho_m*(10.0**log_sig - 1.0)],
+                        fmt="o", ms=3, color="k", label="N-body")
+    ax_top.plot(r_theory, rho_th_plot, "r--", label="Plummer theory")
+    ax_top.set_xscale("log")
+    ax_top.set_yscale("log")
+    ax_top.set_xlabel("r")
+    ax_top.set_title(label)
+    ax_top.legend(fontsize=7)
+    if col == 0:
+        ax_top.set_ylabel("density")
+
+    # ---- bottom: fractional residual (rho - rho_theory) / rho_theory ----
+    ax_bot.axhline(0.0, color="r", ls="--", lw=0.8, label="Plummer")
+    if r_m is not None:
+        rho_th_at_rm = np.array([plummer_rho(r) for r in r_m])
+        valid = rho_th_at_rm > 0
+        resid = np.where(valid, (rho_m - rho_th_at_rm) / rho_th_at_rm, np.nan)
+        err   = np.where(valid, 1.0 / np.sqrt(np.maximum(cnts, 1)), np.nan)
+        ax_bot.errorbar(r_m, resid, yerr=err, fmt="o", ms=3, color="k")
+        # shade Poisson noise floor
+        poisson_floor = np.nanmean(err)
+        ax_bot.axhspan(-poisson_floor, poisson_floor,
+                       color="0.85", alpha=0.5, label=f"±1/√N  (~{poisson_floor:.2f})")
+    ax_bot.axhline(0.0, color="r", ls="--", lw=0.8)
+    ax_bot.set_xscale("log")
+    ax_bot.set_xlabel("r")
+    ax_bot.set_ylim(-0.5, 0.5)
+    ax_bot.legend(fontsize=7)
+    if col == 0:
+        ax_bot.set_ylabel(r"$(\rho - \rho_\mathrm{th})\,/\,\rho_\mathrm{th}$")
+
 plt.tight_layout()
 fname = os.path.join(run_dir, "plot_bg_density.pdf")
 fig.savefig(fname, bbox_inches="tight")
@@ -990,18 +1055,17 @@ for k, frac in enumerate(LAG_FRACS):
     label = f"r_{int(frac * 100)}%  (th={LAG_THEORY[k]:.3f})"
     axes[0].plot(times, lagr_arr[:, k], lw=1.0, label=label)
     axes[0].axhline(LAG_THEORY[k], ls="--", lw=0.6, alpha=0.5)
-    axes[1].plot(
-        times, lagr_arr[:, k] / lagr_arr[0, k], lw=1.0, label=f"r_{int(frac * 100)}%"
-    )
+    pct_dev = (lagr_arr[:, k] / lagr_arr[0, k] - 1.0) * 100.0
+    axes[1].plot(times, pct_dev, lw=1.0, label=f"r_{int(frac * 100)}%")
 axes[0].axhline(r_hm, color="k", ls=":", lw=0.8)
 axes[0].set_xlabel("t")
 axes[0].set_ylabel("Lagrangian radius")
 axes[0].set_title("absolute")
 axes[0].legend(fontsize=7)
-axes[1].axhline(1.0, color="k", ls="--", lw=0.8, label="= 1")
+axes[1].axhline(0.0, color="k", ls="--", lw=0.8, label="0% (no change)")
 axes[1].set_xlabel("t")
-axes[1].set_ylabel("r / r(t=0)")
-axes[1].set_title("normalised")
+axes[1].set_ylabel("deviation from t=0  (%)")
+axes[1].set_title("fractional change  [(r(t)/r(0) − 1) × 100%]")
 axes[1].legend(fontsize=7)
 plt.tight_layout()
 fname = os.path.join(run_dir, "plot_bg_lagrangian.pdf")
@@ -1085,22 +1149,21 @@ fig, axes = plt.subplots(1, 2, figsize=(11, 5))
 
 ax = axes[0]
 ax.plot(times, R_M, color="k", lw=0.8, label="R_M(t)  N-body")
-ax.plot(
-    times,
-    R_chandra_Rdep,
-    color="b",
-    lw=1.5,
-    ls="-.",
-    label="Chandra — Plummer DF",
-)
-ax.plot(
-    times,
-    R_chandra_Rdep_Maxwell,
-    color="r",
-    lw=1.0,
-    ls=":",
-    label="Chandra — Maxwell",
-)
+
+# Split each theory curve at R_stall: solid where valid, dotted extrapolation below.
+for R_plot, color, label in [
+    (R_chandra_Rdep_plot,         "b", "Chandra — Plummer DF"),
+    (R_chandra_Rdep_Maxwell_plot, "r", "Chandra — Maxwell"),
+]:
+    i_stall = next((i for i, r in enumerate(R_plot) if r <= R_stall + 1e-4), len(times) - 1)
+    ax.plot(times[:i_stall+1], R_plot[:i_stall+1], color=color, lw=1.5, ls="-.",
+            label=label)
+    if i_stall < len(times) - 1:
+        ax.plot(times[i_stall:], R_plot[i_stall:], color=color, lw=0.9, ls=":",
+                alpha=0.55)
+
+ax.axhline(R_stall, color="0.5", ls="--", lw=0.8,
+           label=rf"$R_\mathrm{{stall}}={R_stall:.2f}$  (lnΛ=0)")
 ax.axhline(r_hm, color="k", ls=":", lw=0.8, label="r_hm")
 ax.set_xlabel("t")
 ax.set_ylabel("R_M")
@@ -1266,6 +1329,71 @@ fig.savefig(fname, bbox_inches="tight")
 plt.close(fig)
 print(f"written: {os.path.basename(fname)}")
 
+# P_METHODS_CLEAN: standalone methods figure.
+# Left:  normalised speed PDFs at R_0 — the integrand shapes.
+# Right: bracket CDFs — the integrated result.
+# Both plotted vs v/v_c(R_0) so the operating point sits at x=1 in both panels.
+# No simulation data: purely theoretical, suitable for a methods section.
+
+v_esc_0_m = plummer_vesc(R_M[0])
+q_M_0_m   = min(v_M[0] / v_esc_0_m, 1.0 - 1e-10) if v_esc_0_m > 1e-12 else 0.5
+X_0_m     = X_arr[0]
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+
+# ---- Left: speed PDFs ----
+ax = axes[0]
+# Plummer PDF in v/v_c: g(q)*q_M_0 where g(q) = q^2(1-q^2)^{7/2} / I_full
+x_p = _q_cdf_grid / q_M_0_m
+y_p = (_f_cdf_grid / _I_q_full) * q_M_0_m   # change of variable: dq = q_M_0 d(v/v_c)
+# Maxwell PDF in v/v_c: f(u)*X_0 where f(u) = (4/sqrt(pi)) u^2 exp(-u^2)
+x_m = _u_cdf_grid / X_0_m
+y_m = (4.0 / math.sqrt(math.pi)) * _f_maxw_grid * X_0_m
+mask_m = x_m <= 3.0
+ax.plot(x_p, y_p, color="b", lw=1.5,
+        label=r"Plummer  $g(q) \propto q^2(1-q^2)^{7/2}$")
+ax.plot(x_m[mask_m], y_m[mask_m], color="r", lw=1.5, ls="--",
+        label=r"Maxwell  $f(u) \propto u^2 e^{-u^2}$")
+ax.axvline(1.0, color="0.4", ls=":", lw=0.8,
+           label=r"$v = v_c(R_0)$")
+ax.axvline(1.0 / q_M_0_m, color="b", ls="--", lw=0.7, alpha=0.5,
+           label=r"$v_\mathrm{esc}(R_0)$  (Plummer cutoff)")
+ax.set_xlabel(r"$v\,/\,v_c(R_0)$")
+ax.set_ylabel("normalised PDF")
+ax.set_title("speed distributions at $R_0$")
+ax.set_xlim(0, 3.0)
+ax.set_ylim(bottom=0)
+ax.legend(fontsize=8)
+
+# ---- Right: bracket CDFs ----
+ax = axes[1]
+x_p2 = _q_cdf_grid / q_M_0_m
+x_m2 = _u_cdf_grid / X_0_m
+mask_m2 = x_m2 <= 3.0
+ax.plot(x_p2, _B_cdf, color="b", lw=1.5,
+        label=r"$B_\mathrm{Plummer}(q)$")
+ax.plot(x_m2[mask_m2], _B_maxw_cdf[mask_m2], color="r", lw=1.5, ls="--",
+        label=r"$B_\mathrm{Maxwell}(X)$")
+B_P_vc_m = float(np.interp(q_M_0_m, _q_cdf_grid, _B_cdf))
+B_M_vc_m = float(np.interp(X_0_m,   _u_cdf_grid, _B_maxw_cdf))
+ax.axvline(1.0, color="0.4", ls=":", lw=0.8,
+           label=rf"$v=v_c(R_0)$:  $B_P={B_P_vc_m:.2f}$,  $B_M={B_M_vc_m:.2f}$")
+ax.scatter([1.0, 1.0], [B_P_vc_m, B_M_vc_m], color=["b", "r"], s=50, zorder=5)
+ax.axvline(1.0 / q_M_0_m, color="b", ls="--", lw=0.7, alpha=0.5,
+           label=r"$v_\mathrm{esc}(R_0)$  (Plummer support ends,  $B_P \to 1$)")
+ax.set_xlabel(r"$v\,/\,v_c(R_0)$")
+ax.set_ylabel("$B$  (fraction of slower particles)")
+ax.set_title("bracket CDFs: Plummer vs Maxwell")
+ax.set_xlim(0, 3.0)
+ax.set_ylim(0, 1.05)
+ax.legend(fontsize=8)
+
+plt.tight_layout()
+fname = os.path.join(run_dir, "plot_methods_clean.pdf")
+fig.savefig(fname, bbox_inches="tight")
+plt.close(fig)
+print(f"written: {os.path.basename(fname)}")
+
 # P2: energetics
 fig, axes = plt.subplots(1, 2, figsize=(11, 5))
 ax = axes[0]
@@ -1278,15 +1406,27 @@ ax.set_yscale("log")
 ax.legend(fontsize=7)
 
 ax = axes[1]
-ax.plot(times, E_orb_M - E_orb_M[0], color="k", lw=1.2, label="dE_orb perturber")
-ax.plot(times, DK_bg, color="0.5", lw=1.2, label="DK_bg background")
-ax.plot(
-    times, (E_orb_M - E_orb_M[0]) + DK_bg, color="0.7", lw=1.0, ls="--", label="sum"
-)
+# Decompose into 4 components that sum EXACTLY to ΔE_tot.
+# E_tot = K_pert + K_bg + W_bg_arr + 0.5*M_p*phi_p
+# → ΔE_tot = DK_pert + DPhi_half + DK_bg + DW_bg   (see code comments)
+phi_p_arr  = E_orb_M - 0.5 * v_M**2                         # potential at perturber
+DK_pert    = 0.5 * M_p * (v_M**2 - v_M[0]**2)               # perturber KE change
+DPhi_half  = 0.5 * M_p * (phi_p_arr - phi_p_arr[0])         # ½ perturber PE change
+# (factor ½ because the perturber-background interaction is split 50/50 in E_tot)
+DK_bg_plot = K_bg_arr - K_bg_arr[0]                          # background KE change
+DW_bg_plot = W_bg_arr - W_bg_arr[0]                          # background PE change
+DE_tot     = E_tot_arr - E_tot_arr[0]                        # total (≈ 0)
+
+ax.plot(times, DK_pert,    color="darkred",        lw=1.2, label=r"$\Delta K_p$  perturber KE")
+ax.plot(times, DPhi_half,  color="tomato",         lw=1.2, label=r"$\Delta\Phi_p$  perturber PE")
+ax.plot(times, DK_bg_plot, color="navy",           lw=1.2, label=r"$\Delta K_\mathrm{bg}$  background KE")
+ax.plot(times, DW_bg_plot, color="cornflowerblue", lw=1.2, label=r"$\Delta W_\mathrm{bg}$  background PE")
+ax.plot(times, DE_tot,     color="green",          lw=1.8, ls="-.",
+        label=r"$\Delta E_\mathrm{tot}$  (sum = conservation check)")
 ax.axhline(0, color="k", lw=0.5)
 ax.set_xlabel("t")
-ax.set_ylabel("energy change")
-ax.set_title("energy partitioning")
+ax.set_ylabel("total energy change")
+ax.set_title("energy partitioning  (4 components + conservation)")
 ax.legend(fontsize=7)
 
 plt.tight_layout()
@@ -1325,7 +1465,7 @@ ax.plot(
     color="k",
     lw=0.8,
     alpha=0.7,
-    label="measured  (-dL/dt |v|/|L|) / a_DF(ln=1)",
+    label=r"measured  $(-\dot{L}\,|v|/|L|)\,/\,a_\mathrm{DF}(v_M,\,\ln\Lambda{=}1)$  [FIX 5]",
 )
 ax.plot(
     times,
@@ -1417,12 +1557,13 @@ if n_unbound_val >= 0:
         f"  ({100 * n_unbound_val / N_BG:.2f}%)"
     )
 print(f"  R_M(0) -> R_M(f):       {R_M[0]:.4f} -> {R_M[-1]:.4f}  (dR/dt={slope_R:.3e})")
+print(f"  R_stall:                {R_stall:.4f}  [M(<R)=M_p, lnΛ=0]")
 print(f"  ln_Lambda_eff (median): {lnlam_eff_med:.3f}")
 print(f"  ln_Lambda(R_M(0)):      {ln_lam_at_R(R_M[0]):.3f}  [= ln(M(<R0)/M_p)]")
 print(f"  ln_Lambda(R_M(f)):      {ln_lam_at_R(R_M[-1]):.3f}  [at final radius]")
 print(f"  DK_bg / K_bg(0):        {DK_bg[-1] / K_bg_arr[0]:.4f}")
 print(f"  B_Plummer at t=0:       {B_X_arr[0]:.4f}  [exact Plummer DF, FIX 3]")
-print(f"  B_Maxwell at t=0:       {B_X_Maxwell_arr[0]:.4f}  [Maxwellian, old]")
+print(f"  B_Maxwell at t=0:       {B_X_Maxwell_arr[0]:.4f}  [Maxwellian, CDF table]")
 print(f"  B_Plummer at t=f:       {B_X_arr[-1]:.4f}")
 print(
     f"  Lz/|L| min:             {float(np.nanmin(Lz_over_L)):.4f}  (1.000 = no precession)"
