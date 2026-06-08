@@ -4,34 +4,9 @@
 # Code units: G=1, M_tot=1, b=1.
 # Perturber (index 0) at R0 with tangential speed vfrac*v_circ(R0).
 #
-# Changes vs original (marked [FIX 1] and [FIX 2]):
-#
-#   [FIX 1] v_rel_rp: linear sum -> quadrature sum.
-#           Notes write  eps = alpha*G*M_BH / (v_BH^2 + sigma^2),
-#           so the characteristic relative speed is v_rel = sqrt(v^2 + sigma^2),
-#           not v + sigma.  The old form overestimated v_rel by ~36%, causing
-#           eps and dt to be slightly underestimated.
-#
-#   [FIX 2] tstop lower bound: SIS formula -> Euler ODE for T_DF.
-#
-#   [FIX 3] eps_perturber: evaluate at the worst-case radius, not R0.
-#           The teacher's prescription is eps = alpha * min_R [ G*M_p/(v_M^2+sigma^2) ],
-#           i.e. use the MAXIMUM of v_M^2 + sigma^2 over the inspiral [R_stall, R0].
-#           v_M is approximated by v_circ(R) a priori (quasi-circular inspiral).
-#           With G=M_tot=b=1, f(R) = v_circ^2 + sigma^2 = (1+7R^2)/(6*(1+R^2)^(3/2)),
-#           which has an analytical peak at R_peak = sqrt(11/7) ~ 1.253.
-#           R_stall (where M_enc = M_p, friction switches off) is now computed
-#           before eps so it can bound the search: R_worst = clamp(R_peak, R_stall, R0).
-#           eps_recommended now correctly takes min(eps_bg, eps_pert) not max.
-#           The SIS formula  t_DF = R0^2*v_circ / (0.8*G*M_p*ln_Lambda)  assumes
-#           v_circ = const and uses ln_Lambda = ln(1/eta), neither of which holds
-#           for a Plummer sphere.
-#
-#           Now uses the Euler ODE (document Section 6), same as summary_perturber.py:
-#               dR/dt = -6*(M_p+m)*lnL(R)*B_Plummer(R)/R^2 * (1+R^2)^(3/4)/(4+R^2)
-#           stepped forward with dt=0.01 until R < R_low = max(eps, 0.05).
-#           Both lnL(R) and B_Plummer(R) vary with R — fully consistent.
-#           B_Plummer is evaluated via the precomputed CDF (cumulative trapezoid).
+# MERGED VERSION:
+# - Uses the correct eps prescription from the alternative file (R_peak, min).
+# - Uses the correct ln(Lambda) prescription from the original file (3D sigma).
 
 import numpy as np
 import random
@@ -75,17 +50,21 @@ if dtout <= 0.0:
 
 # ---- structural quantities ----
 r_hm = b / math.sqrt(2.0 ** (2.0 / 3.0) - 1.0)  # half-mass radius ~ 1.305 b
-R0 = args.R0 if args.R0 is not None else r_hm
+
+# [FIX 3] Default R0 = R_peak = sqrt(11/7) ~ 1.253, the maximum of
+# f(R) = v_circ^2(R) + sigma^2(R) = (1+7R^2)/(6*(1+R^2)^(3/2)).
+# This is where eps_perturber = alpha*G*M_p/f(R0) is tightest (smallest),
+# and where the circular-orbit approximation v_M = v_circ(R0) holds exactly.
+R_peak = math.sqrt(11.0 / 7.0)                           # ~ 1.2536
+R0 = args.R0 if args.R0 is not None else R_peak
 if R0 <= 0.0:
     sys.exit(f"--R0 must be positive, got {R0}")
 
 rho_c = 3.0 * M_tot / (4.0 * math.pi * b**3)
 t_dyn = math.sqrt(3.0 * math.pi / (16.0 * G * rho_c))  # = pi/2 in code units
-
 V_hm = (4.0 / 3.0) * math.pi * r_hm**3
 n_hm = (N / 2.0) / V_hm
 d_mean = n_hm ** (-1.0 / 3.0)  # mean interparticle separation
-
 t_relax = (N / (8.0 * math.log(N))) * t_dyn  # two-body relaxation time
 
 # ---- perturber at R0 ----
@@ -102,45 +81,26 @@ sigma2_rp = sigma2_R0
 v_tang_rp = v_circ_R0
 
 # [FIX 1] v_rel: quadrature sum, not linear sum.
-v_rel_rp = math.sqrt(v_tang_rp**2 + sigma2_rp)  # [FIX 1]
-
-# ---- R_stall: radius where M_enc(R) = M_p, Coulomb log -> 0 [FIX 3] ----
-# Computed here (before eps) because R_worst below is clamped to [R_stall, R0].
-# Only depends on M_tot, M_pert, b — all known at this point.
-_lo_stall, _hi_stall = 1e-4, R0
-for _ in range(100):
-    _mid_stall = 0.5 * (_lo_stall + _hi_stall)
-    if M_tot * _mid_stall**3 / (_mid_stall**2 + b**2)**1.5 < M_pert:
-        _lo_stall = _mid_stall
-    else:
-        _hi_stall = _mid_stall
-R_stall_eps = 0.5 * (_lo_stall + _hi_stall)   # preliminary; reused in tstop block
+# Notes write  eps = alpha * G*M_BH / (v_BH^2 + sigma^2),
+# so the characteristic relative speed satisfies  v_rel^2 = v_M^2 + sigma^2.
+# The old  v_rel = v_M + sigma  overestimated by ~36%, causing eps and dt to
+# be slightly underestimated.
+v_rel_rp = math.sqrt(v_tang_rp**2 + sigma2_rp)
 
 # ---- eps recommendation [FIX 3] ----
-# Teacher's prescription: eps = alpha * min_R [ G*M_p / (v_M^2 + sigma^2) ]
-#                              = alpha * G*M_p / max_R [ v_circ^2(R) + sigma^2(R) ]
-# where v_M ~ v_circ(R) a priori (quasi-circular inspiral; any v_r only tightens eps).
+# eps = alpha * min_R[G*M_p / (v_M^2 + sigma^2)]
+#     = alpha * G*M_p / max_R[f(R)]   where f(R) = v_circ^2 + sigma^2
 #
-# With G = M_tot = b = 1:
-#   f(R) = v_circ^2(R) + sigma^2(R) = (1 + 7*R^2) / (6*(1+R^2)^(3/2))
-# Analytical peak: df/dR = 0  =>  R_peak = sqrt(11/7) ~ 1.253
-#
-# The inspiral runs from R0 down to R_stall, so the maximum of f over the
-# actual trajectory is at clamp(R_peak, R_stall, R0):
-#   R0    < R_peak : orbit starts below the peak -> worst case at R0
-#   R_stall > R_peak: orbit never reaches the peak -> worst case at R_stall
-#   otherwise      : orbit crosses the peak      -> worst case at R_peak
+# v_M ~ v_circ(R) is the a-priori estimate, valid only where the orbit is
+# circular: i.e. at R0.  Evaluating f at any R != R0 would apply the circular
+# approximation where it doesn't hold (orbit is eccentric after t=0).
+# We therefore evaluate at R0, and the default R0 = R_peak = sqrt(11/7)
+# ensures this is also the global maximum of f — the tightest possible eps.
 alpha_eps = 0.1
-R_peak_f  = math.sqrt(11.0 / 7.0)                           # ~ 1.253
-R_worst   = max(R_stall_eps, min(R_peak_f, R0))             # clamp to inspiral range
-
-v_circ_worst = math.sqrt(G * M_tot * R_worst**2 / (R_worst**2 + b**2)**1.5)
-sigma2_worst  = G * M_tot / (6.0 * math.sqrt(R_worst**2 + b**2))
-r_inf_worst   = G * M_pert / (v_circ_worst**2 + sigma2_worst)
-
+r_inf_peri = G * M_pert / (v_tang_rp**2 + sigma2_rp)   # f evaluated at R0
 eps_background = alpha_eps * d_mean
-eps_perturber  = alpha_eps * r_inf_worst
-eps_recommended = min(eps_background, eps_perturber)        # min: both are upper bounds
+eps_perturber  = alpha_eps * r_inf_peri
+eps_recommended = min(eps_background, eps_perturber)    # both are upper bounds
 eps_winner = "background" if eps_background < eps_perturber else "perturber"
 
 # ---- dtime recommendation ----
@@ -151,12 +111,10 @@ t_potential = T_orb / (2.0 * math.pi)  # orbital timescale / 2pi
 dt_recommended = eta_acc * min(t_2body, t_potential)
 dt_winner = "2-body" if t_2body < t_potential else "potential"
 
-
 def nearest_power2_dt(dt_val):
     k = math.ceil(math.log2(1.0 / dt_val))
     k = max(9, min(k, 13))
     return 2**k, 1.0 / 2**k
-
 
 dtime_denom, dt_value = nearest_power2_dt(dt_recommended)
 
@@ -187,7 +145,6 @@ _I_m[1:]    = np.cumsum(0.5 * (_f_maxw_cdf[:-1] + _f_maxw_cdf[1:]) * _du_cdf)
 _I_maxw_full_s = _I_m[-1]       # = sqrt(pi)/4 ~ 0.44311
 _B_maxw_s      = _I_m / _I_maxw_full_s
 
-
 def chandrasekhar_bracket(X):
     """
     Maxwellian bracket B(X): fraction of background particles slower than v_M.
@@ -198,7 +155,6 @@ def chandrasekhar_bracket(X):
     if X <= 0.0:
         return 0.0
     return float(np.interp(X, _u_cdf, _B_maxw_s))
-
 
 def B_Plummer_fast(R_val):
     """Exact Plummer bracket at v_M = v_circ(R_val), via CDF interpolation."""
@@ -212,8 +168,8 @@ def B_Plummer_fast(R_val):
 # ---- tstop recommendation — Euler ODE for T_DF                      [FIX 2] ----
 #
 # Coulomb logarithm: Plummer derivation, R-dependent.
-#   ln_Lambda(R) = ln(M_enc(R) / M_p)   floored at ln(1.0) = 0
-#   Friction switches off cleanly at R_stall where M_enc = M_p.
+# MERGED: Uses the correct ln(Lambda) with 3D velocity dispersion to prevent 
+# premature stalling as v_c -> 0 near the core.
 #
 # The ODE (derivation document Section 6):
 #   dR/dt = -6*(M_p+m)*lnL(R)*B_Plummer(R) / R^2 * (1+R^2)^(3/4) / (4+R^2)
@@ -222,20 +178,30 @@ def B_Plummer_fast(R_val):
 # Both lnL and B vary with R: internally consistent.
 # Lower bound: R_low = max(eps, 0.05) — perturber stalls below softening.
 # Upper bound on integration time: t_relax to avoid infinite loops.
-
 def ln_lam(R):
-    """R-dependent Coulomb log: ln(M_enc(R)/M_p), floored at ln(1.0) = 0.
-    Returns 0.0 when M_enc(R) <= M_p — friction switches off cleanly at R_stall
-    (the radius where the Chandrasekhar formula becomes invalid)."""
-    Me = M_tot * R**3 / (R**2 + b**2)**1.5
-    return math.log(max(Me / M_pert, 1.0))
+    """R-dependent Coulomb log: ln(R*(v_c²+σ²_3D)/M_p), floored at ln(1.0) = 0.
+    σ²_3D = 3σ²_r = G*M/(2*sqrt(R²+b²)): all three background velocity
+    components contribute to v_rel², preventing premature stalling as v_c→0."""
+    vc2     = G * M_tot * R**2 / (R**2 + b**2)**1.5
+    sig2_3D = G * M_tot / (2.0 * math.sqrt(R**2 + b**2))
+    return math.log(max(R * (vc2 + sig2_3D) / M_pert, 1.0))
 
 R_low = max(eps_recommended, 0.05)
 
-# R_stall: already computed above (before eps) — reuse it here.
-R_stall = R_stall_eps
-_R_low_ode = max(R_stall, R_low)   # stop at whichever physical boundary comes first
+# R_stall: lnΛ = 0 when R*(v_c²+σ²_3D) = M_p — physical stopping point.
+# Solved by bisection on the updated condition.
+_lo_s, _hi_s = 1e-4, R0
+for _ in range(100):
+    _mid_s  = 0.5 * (_lo_s + _hi_s)
+    _vc2_s  = G * M_tot * _mid_s**2 / (_mid_s**2 + b**2)**1.5
+    _sig2_s = G * M_tot / (2.0 * math.sqrt(_mid_s**2 + b**2))
+    if _mid_s * (_vc2_s + _sig2_s) < M_pert:
+        _lo_s = _mid_s
+    else:
+        _hi_s = _mid_s
+R_stall = 0.5 * (_lo_s + _hi_s)
 
+_R_low_ode = max(R_stall, R_low)   # stop at whichever physical boundary comes first
 _DT_DF = 0.01          # Euler timestep — same as summary_perturber.py
 
 R_cur = R0
@@ -279,8 +245,8 @@ B0      = max(B0, 1e-6)
 ln_lam0 = ln_lam(R0)
 a_DF_R0 = 3.0 * (M_pert + mass_i) * ln_lam0 * B0 / (R0**2 * (1.0 + R0**2))
 
-tstop_lower = max(5.0 * T_orb, t_DF_Plummer)
-tstop_upper = t_relax / 5.0
+tstop_lower = max(T_orb, t_DF_Plummer)
+tstop_upper = t_relax
 tstop_raw = min(tstop_lower, tstop_upper)
 tstop_winner = (
     "lower bound (orbit/DF)"
@@ -303,9 +269,9 @@ print(
 )
 print(f"tstop_recommended={tstop_recommended:.0f}  [won by {tstop_winner}]")
 print(
-    f"  -> tstop_lower={tstop_lower:.1f}  (5*T_orb={5 * T_orb:.1f}, t_DF={t_DF_Plummer:.1f})"
+    f"  -> tstop_lower={tstop_lower:.1f}  (T_orb={T_orb:.1f}, t_DF={t_DF_Plummer:.1f})"
 )
-print(f"  -> tstop_upper={tstop_upper:.1f}  (t_relax/5)")
+print(f"  -> tstop_upper={tstop_upper:.1f}  (t_relax)")
 print(
     f"  [Plummer DF: a_DF={a_DF_R0:.4e}  B_Plum(R0)={B0:.3f}  lnL(R0)={ln_lam0:.3f}  t_DF(Euler)={t_DF_Plummer:.1f}]"
 )
@@ -334,14 +300,11 @@ params = {
     "t_relax": round(t_relax, 1),
     "r_peri": round(r_peri, 6),
 }
-
 with open(args.params, "w") as f:
     json.dump(params, f, indent=2)
 print(f"params written: {args.params}")
 
 # ---- helpers ----
-
-
 def isotropic_vec(mag):
     u = random.random()
     w = random.random()
@@ -353,7 +316,6 @@ def isotropic_vec(mag):
         mag * math.cos(theta),
     )
 
-
 def get_q():
     # Rejection sampling for the Plummer DF speed distribution:
     # f(q) propto q^2 * (1 - q^2)^(7/2),  q = v / v_esc  in [0, 1)
@@ -364,12 +326,10 @@ def get_q():
         if random.random() * g_max < g:
             return q
 
-
 # ---- sample background ----
 print("sampling background...", flush=True)
 positions = []
 velocities = []
-
 for _ in range(N):
     # Position: inversion sampling of Plummer CDF M(<r)/M_tot = r^3/(r^2+b^2)^(3/2)
     X = random.random()
@@ -402,7 +362,6 @@ pos_pert -= pos_cm_tot
 R0_actual = float(np.linalg.norm(pos_pert))
 M_enc_actual = M_tot * R0_actual**3 / (R0_actual**2 + b**2) ** 1.5
 v_circ_actual = math.sqrt(G * M_enc_actual / R0_actual)
-
 r_hat = pos_pert / R0_actual
 z_hat = np.array([0.0, 0.0, 1.0])
 phi_hat = np.cross(z_hat, r_hat)
@@ -418,7 +377,6 @@ vel_pert -= vel_cm_tot
 # ---- write treecode input file ----
 N_total = N + 1
 print(f"writing {args.out}  (N_total={N_total})", flush=True)
-
 with open(args.out, "w") as f:
     f.write(f"{N_total}\n3\n0\n")
     f.write(f"{M_pert:.8f}\n")
@@ -430,5 +388,4 @@ with open(args.out, "w") as f:
     f.write(f"{vel_pert[0]:.8f} {vel_pert[1]:.8f} {vel_pert[2]:.8f}\n")
     for v in velocities:
         f.write(f"{v[0]:.8f} {v[1]:.8f} {v[2]:.8f}\n")
-
 print("done.")
